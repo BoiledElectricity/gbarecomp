@@ -45,6 +45,12 @@ struct RunOptions {
     // unless it matches, so title / menu / battle screens never expose the
     // background's horizontal wrap as duplicated scenery. Leaving the address
     // zero keeps expansion unconditional.
+    // Bitmask of regular BG layers whose expanded-view margins may be sourced
+    // from a game-supplied tilemap provider. Zero keeps the fail-closed
+    // default, where unauthored margins render black — which is also what a
+    // game gets if it ships a provider but never declares the layers.
+    int ws_authored_margin_layers = 0;
+
     std::uint32_t view_gate_addr  = 0;
     std::uint32_t view_gate_value = 0;
     std::uint32_t view_gate_mask  = 0xFFFFFFFEu;   // ignore the Thumb bit
