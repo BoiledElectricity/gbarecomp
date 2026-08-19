@@ -98,6 +98,23 @@ void runtime_set_frame_present_hook(std::function<bool()>);
 namespace gbarecomp {
 namespace {
 
+// ── Event-driven autosave ────────────────────────────────────────────────
+// The recompiler emits a call to g_runtime_fn_entry_hook at every generated
+// function entry, so a game can name the routines worth snapshotting after —
+// healing your party, receiving a caught Pokemon, a level-up flourish. The
+// hook only raises a flag; the snapshot itself is taken at a frame boundary,
+// because that is the only place the host call-return stack is consistent.
+std::vector<uint32_t>   g_autosave_pcs;      // sorted, Thumb bit cleared
+std::atomic<bool>       g_autosave_pending{false};
+void (*g_autosave_prev_hook)(uint32_t) = nullptr;
+
+void autosave_fn_entry_hook(uint32_t entry_pc) {
+    const uint32_t pc = entry_pc & ~1u;
+    if (std::binary_search(g_autosave_pcs.begin(), g_autosave_pcs.end(), pc))
+        g_autosave_pending.store(true, std::memory_order_relaxed);
+    if (g_autosave_prev_hook) g_autosave_prev_hook(entry_pc);
+}
+
 // Side-effect-free guest word read for the view gate. Deliberately not
 // bus.read32(), which models open bus and prefetch — polling the gate must not
 // perturb the machine it is observing.
@@ -165,6 +182,12 @@ struct Args {
     std::string dump_bmp;
     std::string dump_png;    // --dump-png: final framebuffer as PNG (preferred)
     std::string load_state;  // --load-state <path>: headless savestate load
+    int  autosave_minutes = 0;    // --autosave N: rotating snapshot every N min
+    bool load_autosave = false;   // --load-autosave: boot from the newest one
+    // Guest PCs that should trigger a snapshot when entered. Per-game, from
+    // [autosave].triggers — e.g. the routine that heals your party, the one
+    // that hands you a caught Pokemon.
+    std::vector<uint32_t> autosave_trigger_pcs;
     // [video] screen = raw|unlit|frontlit|backlit|classic — present-time
     // color simulation (see color_lut). Empty = raw (passthrough). The
     // GBARECOMP_SCREEN env var overrides this at launch; --screen overrides
@@ -586,6 +609,33 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
             args->rom_sha1 = lower_ascii(val);
         } else if (section == "rom" && key == "crc32") {
             args->rom_crc32 = parse_hex_u32(val);
+        } else if (section == "autosave" && key == "minutes" && !val.empty()) {
+            uint64_t n = 0;
+            if (!parse_u64(val, &n)) {
+                if (err) *err = "invalid [autosave].minutes in " + path.string();
+                return false;
+            }
+            args->autosave_minutes = static_cast<int>(n);
+        } else if (section == "autosave" && key == "triggers" && !val.empty()) {
+            // Comma-separated guest PCs. Thumb bit is irrelevant to the entry
+            // hook, which reports the aligned entry address.
+            std::size_t pos = 0;
+            while (pos < val.size()) {
+                std::size_t comma = val.find(',', pos);
+                if (comma == std::string::npos) comma = val.size();
+                std::string tok = val.substr(pos, comma - pos);
+                while (!tok.empty() && std::isspace((unsigned char)tok.front()))
+                    tok.erase(tok.begin());
+                while (!tok.empty() && std::isspace((unsigned char)tok.back()))
+                    tok.pop_back();
+                if (!tok.empty()) {
+                    uint64_t v = 0;
+                    if (parse_u64(tok, &v))
+                        args->autosave_trigger_pcs.push_back(
+                            static_cast<uint32_t>(v) & ~1u);
+                }
+                pos = comma + 1;
+            }
         } else if (section == "save" && key == "path" && !val.empty()) {
             args->save_path = resolve_config_path(base, val);
         } else if (section == "save" && key == "size" && !val.empty()) {
@@ -631,7 +681,7 @@ void find_config_arg(int argc, char** argv, Args* args) {
         if ((s == "--bios" || s == "--rom" || s == "--bios-sha1" ||
              s == "--rom-sha1" || s == "--steps" || s == "--frames" ||
              s == "--scale" || s == "--tcp" || s == "--dump-bmp" ||
-             s == "--dump-png" || s == "--load-state" ||
+             s == "--dump-png" || s == "--load-state" || s == "--autosave" ||
              s == "--view-width" || s == "--widescreen" ||
              s == "--save" || s == "--save-path") &&
             i + 1 < argc) {
@@ -750,6 +800,20 @@ bool parse_cli(int argc, char** argv, Args* args, std::string* err) {
                 if (err) *err = "invalid --scale value";
                 return false;
             }
+            continue;
+        }
+        if (s == "--autosave") {
+            const char* v = need_value("--autosave");
+            if (!v) return false;
+            if (!parse_int(v, &args->autosave_minutes) ||
+                args->autosave_minutes < 0) {
+                if (err) *err = "invalid --autosave value (minutes, 0 = off)";
+                return false;
+            }
+            continue;
+        }
+        if (s == "--load-autosave") {
+            args->load_autosave = true;
             continue;
         }
         if (s == "--tcp") {
@@ -1580,6 +1644,23 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             ws_sidecar_init_from_config(sc);
         } else {
             ws_sidecar_init_from_env();
+        }
+    }
+
+    // Autosave triggers. Installed after the sidecar so its hook is chained
+    // rather than replaced — the recompiler emits one entry-hook call site,
+    // and both features want it.
+    if (!args.autosave_trigger_pcs.empty()) {
+        g_autosave_pcs = args.autosave_trigger_pcs;
+        std::sort(g_autosave_pcs.begin(), g_autosave_pcs.end());
+        g_autosave_pcs.erase(
+            std::unique(g_autosave_pcs.begin(), g_autosave_pcs.end()),
+            g_autosave_pcs.end());
+        g_autosave_prev_hook = g_runtime_fn_entry_hook;
+        g_runtime_fn_entry_hook = &autosave_fn_entry_hook;
+        if (!args.quiet) {
+            std::printf("autosave: %zu trigger PC(s) armed\n",
+                        g_autosave_pcs.size());
         }
     }
 
@@ -2472,6 +2553,31 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // self-heal at a deep-gameplay finder gap) without driving blind input
     // through the intro. do_savestate_load realigns the frame counter and
     // re-origins the fingerprint clock at the load point.
+    // --load-autosave: resume from the newest autosave ring slot. Resolved
+    // here, just before the load, so it shares --load-state's boot path.
+    if (args.load_autosave && args.load_state.empty()) {
+        std::filesystem::file_time_type newest{};
+        std::string newest_path;
+        for (int slot = 0; slot < 3; ++slot) {
+            std::filesystem::path p(args.rom);
+            p.replace_extension(".auto" + std::to_string(slot + 1));
+            std::error_code ec;
+            if (!std::filesystem::exists(p, ec) || ec) continue;
+            const auto mt = std::filesystem::last_write_time(p, ec);
+            if (ec) continue;
+            if (newest_path.empty() || mt > newest) {
+                newest = mt;
+                newest_path = p.string();
+            }
+        }
+        if (newest_path.empty()) {
+            std::fprintf(stderr, "[gbarecomp:runtime] --load-autosave: no "
+                                 "autosave found beside %s\n", args.rom.c_str());
+        } else {
+            args.load_state = newest_path;
+        }
+    }
+
     if (!args.load_state.empty()) {
         std::string e;
         if (do_savestate_load(args.load_state, e)) {
@@ -2690,6 +2796,46 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // Battery-save auto-flush debounce (see the loop body). ~1 s at 59.7 Hz.
     constexpr uint64_t kSaveFlushIntervalFrames = 60;
     uint64_t save_last_flush_frame = ppu.frame_count();
+
+    // ── Autosave ────────────────────────────────────────────────────────
+    // Deliberately savestates, not copies of the battery save: the .sav only
+    // changes when the player saves in-game, so copying it can never recover
+    // the case this exists for — forgetting to save. A snapshot restores the
+    // machine as it stood, and lives in its own files, so the cartridge save
+    // is never touched by any of this.
+    //
+    // A ring rather than one file, because the point is to step BACK past
+    // something. One slot would have the next autosave overwrite the moment
+    // you wanted to return to.
+    constexpr int kAutosaveSlots = 3;
+    // Level-ups and captures arrive in bursts; without a floor a single
+    // battle would spend the whole ring in a few seconds.
+    constexpr uint64_t kAutosaveMinGapFrames = 60 * 30;   // ~30 s
+    const uint64_t autosave_interval_frames =
+        args.autosave_minutes > 0
+            ? static_cast<uint64_t>(args.autosave_minutes) * 60ull * 60ull
+            : 0ull;
+    int      autosave_next_slot = 0;
+    uint64_t autosave_last_frame = ppu.frame_count();
+    auto autosave_path = [&](int slot) -> std::string {
+        std::filesystem::path p(args.rom);
+        p.replace_extension(".auto" + std::to_string(slot + 1));
+        return p.string();
+    };
+    auto take_autosave = [&](const char* why) {
+        const std::string path = autosave_path(autosave_next_slot);
+        std::string e;
+        if (do_savestate_save(path, e)) {
+            std::printf("autosave slot=%d reason=%s path=\"%s\"\n",
+                        autosave_next_slot + 1, why, path.c_str());
+            std::fflush(stdout);
+            autosave_next_slot = (autosave_next_slot + 1) % kAutosaveSlots;
+        } else {
+            std::fprintf(stderr, "[gbarecomp:runtime] autosave failed: %s\n",
+                         e.c_str());
+        }
+        autosave_last_frame = ppu.frame_count();
+    };
     if (input_replay_requested) apply_input_replay();
     if (args.window) pump_host_input();
 
@@ -2827,6 +2973,20 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             if (fc_now - save_last_flush_frame >= kSaveFlushIntervalFrames) {
                 flush_save();
                 save_last_flush_frame = fc_now;
+            }
+        }
+        // Autosave, taken here because a frame boundary is the only place the
+        // host call-return stack is consistent enough to snapshot.
+        if (autosave_interval_frames || !g_autosave_pcs.empty()) {
+            const uint64_t fc_now = ppu.frame_count();
+            const bool by_event =
+                g_autosave_pending.exchange(false, std::memory_order_relaxed);
+            const bool by_time =
+                autosave_interval_frames &&
+                fc_now - autosave_last_frame >= autosave_interval_frames;
+            if ((by_event || by_time) &&
+                fc_now - autosave_last_frame >= kAutosaveMinGapFrames) {
+                take_autosave(by_event ? "event" : "timer");
             }
         }
         if (!args.window && args.frames >= 0 &&
