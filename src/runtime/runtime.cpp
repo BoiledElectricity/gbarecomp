@@ -117,11 +117,12 @@ std::uint32_t view_gate_read32(gba::GbaBus& bus, std::uint32_t addr) {
 
 // Per-frame scene policy: outside the scenes the game authorized, fall back to
 // the faithful 240 rather than showing whatever the background wraps to.
-void apply_view_gate(gba::GbaBus& bus, const RunOptions& opts, bool wide) {
-    if (!wide || opts.view_gate_addr == 0) return;
-    const std::uint32_t got =
-        view_gate_read32(bus, opts.view_gate_addr) & opts.view_gate_mask;
-    const std::uint32_t want = opts.view_gate_value & opts.view_gate_mask;
+std::uint32_t g_gate_addr = 0, g_gate_value = 0, g_gate_mask = 0xFFFFFFFEu;
+
+void apply_view_gate(gba::GbaBus& bus, bool wide) {
+    if (!wide || g_gate_addr == 0) return;
+    const std::uint32_t got = view_gate_read32(bus, g_gate_addr) & g_gate_mask;
+    const std::uint32_t want = g_gate_value & g_gate_mask;
     gba::g_ws_pillarbox = (got == want) ? 0 : 1;
     if (std::getenv("GBARECOMP_VIEW_GATE_DEBUG")) {
         static std::uint32_t last = 0xFFFFFFFFu;
@@ -129,7 +130,7 @@ void apply_view_gate(gba::GbaBus& bus, const RunOptions& opts, bool wide) {
             last = got;
             std::fprintf(stderr,
                          "[view_gate] addr=%08X got=%08X want=%08X -> %s\n",
-                         opts.view_gate_addr, got, want,
+                         g_gate_addr, got, want,
                          gba::g_ws_pillarbox ? "PILLARBOX" : "WIDE");
             std::fflush(stderr);
         }
@@ -165,6 +166,10 @@ struct Args {
     std::string dump_bmp;
     std::string dump_png;    // --dump-png: final framebuffer as PNG (preferred)
     std::string load_state;  // --load-state <path>: headless savestate load
+    // Per-game widescreen addresses from [widescreen]. Zero = fall back to
+    // whatever the game runner passed in RunOptions.
+    uint32_t ws_draw_metatile = 0, ws_tilemap_ptrs = 0, ws_mapheader = 0;
+    uint32_t ws_curcoords = 0, ws_gmain = 0, ws_cb2_overworld = 0;
     int  autosave_minutes = 0;    // --autosave N: rotating snapshot every N min
     bool load_autosave = false;   // --load-autosave: boot from the newest one
     // [video] screen = raw|unlit|frontlit|backlit|classic — present-time
@@ -588,6 +593,17 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
             args->rom_sha1 = lower_ascii(val);
         } else if (section == "rom" && key == "crc32") {
             args->rom_crc32 = parse_hex_u32(val);
+        } else if (section == "widescreen" && !val.empty()) {
+            uint64_t n = 0;
+            if (parse_u64(val, &n)) {
+                const uint32_t v = static_cast<uint32_t>(n);
+                if      (key == "draw_metatile") args->ws_draw_metatile = v;
+                else if (key == "tilemap_ptrs")  args->ws_tilemap_ptrs  = v;
+                else if (key == "mapheader")     args->ws_mapheader     = v;
+                else if (key == "curcoords")     args->ws_curcoords     = v;
+                else if (key == "gmain")         args->ws_gmain         = v;
+                else if (key == "cb2_overworld") args->ws_cb2_overworld = v;
+            }
         } else if (section == "autosave" && key == "minutes" && !val.empty()) {
             uint64_t n = 0;
             if (!parse_u64(val, &n)) {
@@ -1591,15 +1607,33 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // path on its own content, so it does not need the WIP kill-switch. That
     // switch guards the env-configured probe path, where a wrong address just
     // renders garbage.
-    if (ws_wip_enabled || (opts.ws_draw_metatile_pc && opts.ws_tilemap_ptrs)) {
-        if (opts.ws_draw_metatile_pc && opts.ws_tilemap_ptrs) {
+    // game.toml [widescreen] wins over the runner's defaults: main.cpp is one
+    // file shared by every variant, and these addresses differ per game.
+    const uint32_t eff_dm    = args.ws_draw_metatile ? args.ws_draw_metatile
+                                                     : opts.ws_draw_metatile_pc;
+    const uint32_t eff_tm    = args.ws_tilemap_ptrs ? args.ws_tilemap_ptrs
+                                                    : opts.ws_tilemap_ptrs;
+    const uint32_t eff_mh    = args.ws_mapheader ? args.ws_mapheader
+                                                 : opts.ws_mapheader;
+    const uint32_t eff_cc    = args.ws_curcoords ? args.ws_curcoords
+                                                 : opts.ws_curcoords;
+    const uint32_t eff_gmain = args.ws_gmain ? args.ws_gmain
+                             : (opts.view_gate_addr ? opts.view_gate_addr - 4u : 0u);
+    const uint32_t eff_cb2   = args.ws_cb2_overworld ? args.ws_cb2_overworld
+                                                     : opts.view_gate_value;
+    g_gate_addr  = eff_gmain ? eff_gmain + 4u : 0u;
+    g_gate_value = eff_cb2;
+    g_gate_mask  = opts.view_gate_mask;
+
+    if (ws_wip_enabled || (eff_dm && eff_tm)) {
+        if (eff_dm && eff_tm) {
             WsSidecarConfig sc;
-            sc.draw_metatile_pc = opts.ws_draw_metatile_pc;
-            sc.tilemap_ptrs     = opts.ws_tilemap_ptrs;
-            sc.mapheader        = opts.ws_mapheader;
-            sc.gmain            = opts.view_gate_addr ? opts.view_gate_addr - 4u : 0u;
-            sc.cb2_overworld    = opts.view_gate_value;
-            sc.curcoords        = opts.ws_curcoords;
+            sc.draw_metatile_pc = eff_dm;
+            sc.tilemap_ptrs     = eff_tm;
+            sc.mapheader        = eff_mh;
+            sc.gmain            = eff_gmain;
+            sc.cb2_overworld    = eff_cb2;
+            sc.curcoords        = eff_cc;
             ws_sidecar_init_from_config(sc);
         } else {
             ws_sidecar_init_from_env();
@@ -1749,7 +1783,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // Every driver of the machine — windowed, headless, and the TCP
         // debug server — goes through here, so the per-frame scene policy
         // belongs here rather than in any one loop.
-        apply_view_gate(bus, opts, args.view_width > 240);
+        apply_view_gate(bus, args.view_width > 240);
         uint64_t start_vbl = g_runtime_vblank_starts;
         constexpr uint64_t kMaxDispatchesPerFrame = 2'000'000ull;
         for (uint64_t i = 0; i < kMaxDispatchesPerFrame; ++i) {
@@ -2823,7 +2857,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // Widescreen sidecar: capture the live tilemap ring once per guest
         // frame (no-op unless armed) so resident tiles are cached before the
         // camera evicts them — the always-on substrate for margin injection.
-        apply_view_gate(bus, opts, args.view_width > 240);
+        apply_view_gate(bus, args.view_width > 240);
         if (ws_sidecar_enabled()) {
             const uint64_t scf = ppu.frame_count();
             if (scf != sc_last_frame) {
@@ -2981,7 +3015,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // Widescreen sidecar: populate the extended tilemap (incl. never-seen
         // margins) via the guest's own draw, then force a FRESH render so the
         // wide path reads the filled cache instead of the run-time latched FB.
-        apply_view_gate(bus, opts, args.view_width > 240);
+        apply_view_gate(bus, args.view_width > 240);
         bool fresh = false;
         if (ws_sidecar_enabled() && args.view_width > 240 &&
             ws_sidecar_active_mode()) {
