@@ -233,7 +233,10 @@ extern "C" int ws_sidecar_provider_adapter(int bg, int hw_x, int screen_y,
 
 void ws_sidecar_init_from_env() {
     if (g_enabled) return;
-    if (parse_hex_env("GBARECOMP_WS_SIDECAR") == 0) return;
+    if (parse_hex_env("GBARECOMP_WS_SIDECAR") == 0) {
+        std::fprintf(stderr, "[ws_sidecar] not armed (GBARECOMP_WS_SIDECAR unset)\n");
+        return;
+    }
     g_dm_pc = parse_hex_env("GBARECOMP_WS_SC_DRAWMETATILE") & ~1u;
     g_tilemap_ptrs = parse_hex_env("GBARECOMP_WS_SC_TILEMAP_PTRS");
     g_mapheader = parse_hex_env("GBARECOMP_WS_SC_MAPHEADER");  // for active fill
@@ -265,6 +268,12 @@ void ws_sidecar_init_from_env() {
     g_runtime_fn_entry_hook = &ws_sidecar_fn_entry_hook;
     gba::g_ws_tilemap_provider = &ws_sidecar_provider_adapter;  // PPU margin source
     g_enabled = true;
+    std::fprintf(stderr,
+                 "[ws_sidecar] armed: dm=%08X tilemaps=%08X mapheader=%08X "
+                 "gmain=%08X cb2=%08X curcoords=%08X active=%d\n",
+                 g_dm_pc, g_tilemap_ptrs, g_mapheader, g_gmain,
+                 g_cb2_overworld, g_curcoords, (int)g_active_mode);
+    std::fflush(stderr);
     std::fprintf(stderr, "[ws-sidecar] armed: DrawMetatileAt=0x%08X "
         "tilemap_ptrs=0x%08X cache=%dx%d\n", g_dm_pc, g_tilemap_ptrs,
         kCacheW, kCacheH);
