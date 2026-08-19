@@ -92,6 +92,50 @@ option(GBA_COSIM
     "Build the first-divergence co-simulation oracle (state hash + TCP park/step)"
     OFF)
 
+# Build the vendored SDL2 checkout (third_party/SDL2) into this project.
+# Used where no system SDL2 is expected: Android always, and any Unix host
+# that has none installed.
+macro(gbarecomp_use_vendored_sdl2 why)
+    set(GBARECOMP_SDL2_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL2"
+        CACHE PATH "SDL2 source tree compiled into this build")
+    if(NOT EXISTS "${GBARECOMP_SDL2_SOURCE}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "${why} needs an SDL2 source tree at\n"
+            "  ${GBARECOMP_SDL2_SOURCE}\n"
+            "git submodule update --init third_party/SDL2")
+    endif()
+    set(SDL_SHARED ON  CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST   OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${GBARECOMP_SDL2_SOURCE}" sdl2_build)
+    set(GBARECOMP_SDL2_OK TRUE)
+    set(SDL2_INCLUDE_DIRS "")
+    set(SDL2_LIBRARIES SDL2::SDL2 SDL2::SDL2main)
+    message(STATUS "gbarecomp: SDL2 from source (${why}) — ${GBARECOMP_SDL2_SOURCE}")
+endmacro()
+
+if(ANDROID)
+    # Android ships no system SDL2, and SDL2's Java shim under
+    # android-project/ must come from the same checkout the native side
+    # links, so the game's Gradle project points its sourceSets at it.
+    gbarecomp_use_vendored_sdl2("Android")
+elseif(NOT WIN32 AND NOT MSYS AND NOT MINGW)
+    # macOS / Linux. The MSYS2-specific warning below about
+    # find_package(SDL2 CONFIG) does not apply here: there is no
+    # `-isystem /mingw64/include` to break libstdc++'s include_next chain.
+    find_package(SDL2 CONFIG QUIET)
+    if(SDL2_FOUND)
+        set(GBARECOMP_SDL2_OK TRUE)
+        set(SDL2_INCLUDE_DIRS "")
+        set(SDL2_LIBRARIES SDL2::SDL2)
+        if(TARGET SDL2::SDL2main)
+            list(APPEND SDL2_LIBRARIES SDL2::SDL2main)
+        endif()
+        message(STATUS "gbarecomp: SDL2 found via CMake config — ${SDL2_DIR}")
+    else()
+        gbarecomp_use_vendored_sdl2("no system SDL2")
+    endif()
+else()
 find_path(SDL2_INCLUDE_DIR
     NAMES SDL.h
     PATH_SUFFIXES SDL2 SDL2/include
@@ -150,6 +194,7 @@ if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
     message(STATUS "gbarecomp: SDL2 found — inc=${SDL2_INCLUDE_DIR} lib=${SDL2_LIBRARY} static=${GBARECOMP_STATIC_RELEASE}")
 else()
     message(STATUS "gbarecomp: SDL2 NOT found — host_window will stub out (inc=${SDL2_INCLUDE_DIR} lib=${SDL2_LIBRARY})")
+endif()
 endif()
 
 if(GBARECOMP_STATIC_RELEASE)
@@ -317,6 +362,10 @@ if(GBARECOMP_SDL2_OK)
     target_include_directories(gbarecomp_runtime PUBLIC ${SDL2_INCLUDE_DIRS})
     target_link_libraries(gbarecomp_runtime PUBLIC ${SDL2_LIBRARIES})
 endif()
+if(ANDROID)
+    # runtime.cpp pumps stdout/stderr into logcat.
+    target_link_libraries(gbarecomp_runtime PUBLIC log)
+endif()
 if(WIN32 OR MSYS)
     # asset_picker uses GetOpenFileNameA (comdlg32) and MessageBoxA (user32).
     # host_platform's FramePacer uses timeBeginPeriod/timeEndPeriod (winmm).
@@ -352,346 +401,352 @@ if(GBA_COSIM)
     message(STATUS "gbarecomp: GBA_COSIM ON — first-divergence oracle compiled in")
 endif()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# tools — small CLI utilities. Each is a separate executable.
-# ─────────────────────────────────────────────────────────────────────────────
-function(target_link_gbarecomp_runtime_stack target_name)
-    if(MINGW OR MSYS)
-        target_link_libraries(${target_name} PRIVATE
-            -Wl,--start-group
-            gbarecomp_armv4t gbarecomp_gba gbarecomp_runtime gbarecomp_debug
-            -Wl,--end-group)
+# Host tools and tests (gba_recompile, gba_scan, the ctest suite) are
+# build-machine binaries — an Android cross-build has no use for them, and
+# configuring them would pull toml++ down for a tool that is never built.
+if(NOT ANDROID)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # tools — small CLI utilities. Each is a separate executable.
+    # ─────────────────────────────────────────────────────────────────────────────
+    function(target_link_gbarecomp_runtime_stack target_name)
+        if(MINGW OR MSYS)
+            target_link_libraries(${target_name} PRIVATE
+                -Wl,--start-group
+                gbarecomp_armv4t gbarecomp_gba gbarecomp_runtime gbarecomp_debug
+                -Wl,--end-group)
+        else()
+            target_link_libraries(${target_name} PRIVATE
+                gbarecomp_armv4t gbarecomp_gba gbarecomp_runtime gbarecomp_debug)
+        endif()
+    endfunction()
+
+    function(add_gbarecomp_runtime_stack_test target_name source_file)
+        add_executable(${target_name}
+            ${source_file}
+            tools/bios_smoke/dispatch_stub.cpp)
+        target_include_directories(${target_name} PRIVATE src/debug)
+        target_link_gbarecomp_runtime_stack(${target_name})
+        add_test(NAME ${target_name} COMMAND ${target_name})
+    endfunction()
+
+    add_executable(gba_scan tools/gba_scan/main.cpp)
+    target_link_libraries(gba_scan PRIVATE gbarecomp_armv4t gbarecomp_gba)
+
+    # A local toml++ checkout remains useful for offline development, but it is
+    # intentionally ignored.  Fresh clones/worktrees must still be able to build
+    # gba_recompile, so resolve the pinned upstream dependency into the build tree
+    # when the local single-header checkout is absent.
+    find_path(GBARECOMP_TOMLPP_INCLUDE_DIR
+        NAMES toml.hpp
+        HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlpp"
+        NO_DEFAULT_PATH)
+    if(NOT GBARECOMP_TOMLPP_INCLUDE_DIR)
+        include(FetchContent)
+        set(TOMLPLUSPLUS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(TOMLPLUSPLUS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(tomlplusplus
+            GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+            GIT_TAG 30172438cee64926dc41fdd9c11fb3ba5b2ba9de)
+        FetchContent_MakeAvailable(tomlplusplus)
+        set(GBARECOMP_TOMLPP_INCLUDE_DIR "${tomlplusplus_SOURCE_DIR}")
+        message(STATUS
+            "gbarecomp: fetched pinned toml++ v3.4.0 for gba_recompile")
     else()
-        target_link_libraries(${target_name} PRIVATE
-            gbarecomp_armv4t gbarecomp_gba gbarecomp_runtime gbarecomp_debug)
+        message(STATUS
+            "gbarecomp: using local toml++ at ${GBARECOMP_TOMLPP_INCLUDE_DIR}")
     endif()
-endfunction()
 
-function(add_gbarecomp_runtime_stack_test target_name source_file)
-    add_executable(${target_name}
-        ${source_file}
-        tools/bios_smoke/dispatch_stub.cpp)
-    target_include_directories(${target_name} PRIVATE src/debug)
-    target_link_gbarecomp_runtime_stack(${target_name})
-    add_test(NAME ${target_name} COMMAND ${target_name})
-endfunction()
+    add_executable(gba_recompile
+        tools/gba_recompile/main.cpp
+        tools/gba_recompile/config.cpp)
+    target_include_directories(gba_recompile PRIVATE
+        tools/gba_recompile
+        src/armv4t
+        "${GBARECOMP_TOMLPP_INCLUDE_DIR}")
+    target_link_libraries(gba_recompile PRIVATE
+        gbarecomp_recompile_core gbarecomp_armv4t gbarecomp_gba)
 
-add_executable(gba_scan tools/gba_scan/main.cpp)
-target_link_libraries(gba_scan PRIVATE gbarecomp_armv4t gbarecomp_gba)
+    add_executable(symbol_import tools/symbol_import/main.cpp)
+    target_link_libraries(symbol_import PRIVATE gbarecomp_armv4t)
 
-# A local toml++ checkout remains useful for offline development, but it is
-# intentionally ignored.  Fresh clones/worktrees must still be able to build
-# gba_recompile, so resolve the pinned upstream dependency into the build tree
-# when the local single-header checkout is absent.
-find_path(GBARECOMP_TOMLPP_INCLUDE_DIR
-    NAMES toml.hpp
-    HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlpp"
-    NO_DEFAULT_PATH)
-if(NOT GBARECOMP_TOMLPP_INCLUDE_DIR)
-    include(FetchContent)
-    set(TOMLPLUSPLUS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(TOMLPLUSPLUS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(tomlplusplus
-        GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-        GIT_TAG 30172438cee64926dc41fdd9c11fb3ba5b2ba9de)
-    FetchContent_MakeAvailable(tomlplusplus)
-    set(GBARECOMP_TOMLPP_INCLUDE_DIR "${tomlplusplus_SOURCE_DIR}")
-    message(STATUS
-        "gbarecomp: fetched pinned toml++ v3.4.0 for gba_recompile")
-else()
-    message(STATUS
-        "gbarecomp: using local toml++ at ${GBARECOMP_TOMLPP_INCLUDE_DIR}")
-endif()
+    # test_rom_runner — direct-boots a recompiled jsmolka gba-suite test
+    # ROM and reports r12 at exit. Two targets per ROM (ARM + THUMB):
+    # each ROM is recompiled at build time via gba_recompile and linked
+    # into its own runner exe. Output is the test_rom_runner main
+    # (shared) + the per-ROM generated body.
 
-add_executable(gba_recompile
-    tools/gba_recompile/main.cpp
-    tools/gba_recompile/config.cpp)
-target_include_directories(gba_recompile PRIVATE
-    tools/gba_recompile
-    src/armv4t
-    "${GBARECOMP_TOMLPP_INCLUDE_DIR}")
-target_link_libraries(gba_recompile PRIVATE
-    gbarecomp_recompile_core gbarecomp_armv4t gbarecomp_gba)
+    set(GBA_SUITE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gba_suite)
 
-add_executable(symbol_import tools/symbol_import/main.cpp)
-target_link_libraries(symbol_import PRIVATE gbarecomp_armv4t)
+    # Recompile arm.gba at build time.
+    set(TEST_ROM_ARM_OUTDIR ${CMAKE_CURRENT_BINARY_DIR}/test_rom_arm_gen)
+    set(TEST_ROM_ARM_DISPATCH ${TEST_ROM_ARM_OUTDIR}/dispatch_table.cpp)
+    set(TEST_ROM_ARM_BODIES
+        ${TEST_ROM_ARM_OUTDIR}/recompiled_000.cpp
+        ${TEST_ROM_ARM_OUTDIR}/recompiled_001.cpp)
+    set(TEST_ROM_ARM_HEADER   ${TEST_ROM_ARM_OUTDIR}/recompiled.h)
+    file(MAKE_DIRECTORY ${TEST_ROM_ARM_OUTDIR})
 
-# test_rom_runner — direct-boots a recompiled jsmolka gba-suite test
-# ROM and reports r12 at exit. Two targets per ROM (ARM + THUMB):
-# each ROM is recompiled at build time via gba_recompile and linked
-# into its own runner exe. Output is the test_rom_runner main
-# (shared) + the per-ROM generated body.
+    if(EXISTS ${GBA_SUITE_ROOT}/arm/arm.gba)
+        add_custom_command(
+            OUTPUT  ${TEST_ROM_ARM_DISPATCH} ${TEST_ROM_ARM_BODIES}
+                    ${TEST_ROM_ARM_HEADER}
+            COMMAND $<TARGET_FILE:gba_recompile>
+                    --rom ${GBA_SUITE_ROOT}/arm/arm.gba
+                    --entry 0x080000C0
+                    --codegen-shards 2
+                    --out ${TEST_ROM_ARM_OUTDIR}
+            DEPENDS gba_recompile
+                    ${GBA_SUITE_ROOT}/arm/arm.gba
+            COMMENT "Recompiling gba-suite arm.gba"
+            VERBATIM
+        )
 
-set(GBA_SUITE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gba_suite)
+        add_executable(test_rom_arm
+            tools/test_rom_runner/main.cpp
+            ${TEST_ROM_ARM_DISPATCH}
+            ${TEST_ROM_ARM_BODIES}
+        )
+        target_include_directories(test_rom_arm PRIVATE
+            ${TEST_ROM_ARM_OUTDIR}
+            src/armv4t)
+        target_link_gbarecomp_runtime_stack(test_rom_arm)
+        add_test(NAME test_rom_arm COMMAND test_rom_arm
+            ${GBA_SUITE_ROOT}/arm/arm.gba)
+    else()
+        message(STATUS "gbarecomp: gba-suite arm.gba not found; "
+                       "skipping test_rom_arm target")
+    endif()
 
-# Recompile arm.gba at build time.
-set(TEST_ROM_ARM_OUTDIR ${CMAKE_CURRENT_BINARY_DIR}/test_rom_arm_gen)
-set(TEST_ROM_ARM_DISPATCH ${TEST_ROM_ARM_OUTDIR}/dispatch_table.cpp)
-set(TEST_ROM_ARM_BODIES
-    ${TEST_ROM_ARM_OUTDIR}/recompiled_000.cpp
-    ${TEST_ROM_ARM_OUTDIR}/recompiled_001.cpp)
-set(TEST_ROM_ARM_HEADER   ${TEST_ROM_ARM_OUTDIR}/recompiled.h)
-file(MAKE_DIRECTORY ${TEST_ROM_ARM_OUTDIR})
+    # Recompile thumb.gba at build time.
+    set(TEST_ROM_THUMB_OUTDIR ${CMAKE_CURRENT_BINARY_DIR}/test_rom_thumb_gen)
+    set(TEST_ROM_THUMB_DISPATCH ${TEST_ROM_THUMB_OUTDIR}/dispatch_table.cpp)
+    set(TEST_ROM_THUMB_BODIES
+        ${TEST_ROM_THUMB_OUTDIR}/recompiled_000.cpp
+        ${TEST_ROM_THUMB_OUTDIR}/recompiled_001.cpp)
+    set(TEST_ROM_THUMB_HEADER   ${TEST_ROM_THUMB_OUTDIR}/recompiled.h)
+    file(MAKE_DIRECTORY ${TEST_ROM_THUMB_OUTDIR})
 
-if(EXISTS ${GBA_SUITE_ROOT}/arm/arm.gba)
+    if(EXISTS ${GBA_SUITE_ROOT}/thumb/thumb.gba)
+        add_custom_command(
+            OUTPUT  ${TEST_ROM_THUMB_DISPATCH} ${TEST_ROM_THUMB_BODIES}
+                    ${TEST_ROM_THUMB_HEADER}
+            COMMAND $<TARGET_FILE:gba_recompile>
+                    --rom ${GBA_SUITE_ROOT}/thumb/thumb.gba
+                    --entry 0x080000C0
+                    --codegen-shards 2
+                    --out ${TEST_ROM_THUMB_OUTDIR}
+            DEPENDS gba_recompile
+                    ${GBA_SUITE_ROOT}/thumb/thumb.gba
+            COMMENT "Recompiling gba-suite thumb.gba"
+            VERBATIM
+        )
+
+        add_executable(test_rom_thumb
+            tools/test_rom_runner/main.cpp
+            ${TEST_ROM_THUMB_DISPATCH}
+            ${TEST_ROM_THUMB_BODIES}
+        )
+        target_include_directories(test_rom_thumb PRIVATE
+            ${TEST_ROM_THUMB_OUTDIR}
+            src/armv4t)
+        target_link_gbarecomp_runtime_stack(test_rom_thumb)
+        add_test(NAME test_rom_thumb COMMAND test_rom_thumb
+            ${GBA_SUITE_ROOT}/thumb/thumb.gba)
+    else()
+        message(STATUS "gbarecomp: gba-suite thumb.gba not found; "
+                       "skipping test_rom_thumb target")
+    endif()
+
+    # bios_smoke — Phase 2.1 canary. Loads bios/gba_bios.bin, runs the
+    # interpreter from PC=0 for N instructions, prints a trace.
+    add_executable(bios_smoke tools/bios_smoke/main.cpp
+                              tools/bios_smoke/dispatch_stub.cpp)
+    target_link_gbarecomp_runtime_stack(bios_smoke)
+    if(WIN32 OR MSYS)
+        target_link_libraries(bios_smoke PRIVATE ws2_32)
+    endif()
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # tests — per-subsystem. Run with ctest.
+    # ─────────────────────────────────────────────────────────────────────────────
+    enable_testing()
+
+    add_test(NAME runtime_monolith_guard
+        COMMAND ${CMAKE_COMMAND}
+            -DGBARECOMP_RUNTIME_CMAKE=${CMAKE_CURRENT_BINARY_DIR}/runtime.cmake
+            -DGBARECOMP_TEST_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/runtime_monolith_guard
+            -DGBARECOMP_TEST_BINARY=${CMAKE_CURRENT_BINARY_DIR}/runtime_monolith_guard_test
+            -DGBARECOMP_TEST_GENERATOR=${CMAKE_GENERATOR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/assert_runtime_monolith_guard.cmake)
+
+    add_executable(decoder_smoke tests/armv4t/decoder_smoke.cpp)
+    target_link_libraries(decoder_smoke PRIVATE gbarecomp_armv4t)
+    add_test(NAME decoder_smoke COMMAND decoder_smoke)
+
+    add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
+    target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
+    add_test(NAME function_finder_tests COMMAND function_finder_tests)
+
+    add_executable(codegen_shards_tests tests/recompile/codegen_shards_test.cpp)
+    target_link_libraries(codegen_shards_tests PRIVATE gbarecomp_recompile_core)
+    add_test(NAME codegen_shards_tests COMMAND codegen_shards_tests)
+
+    # Self-heal proposal clustering — pure logic, links only the standalone
+    # clustering TU (no runtime/bus/overlay dependencies).
+    add_executable(selfheal_cluster_test
+        tests/selfheal/cluster_test.cpp
+        src/runtime/self_heal_cluster.cpp)
+    target_include_directories(selfheal_cluster_test PRIVATE src/runtime)
+    add_test(NAME selfheal_cluster_test COMMAND selfheal_cluster_test)
+
+    add_executable(interpreter_smoke tests/armv4t/interpreter_smoke.cpp)
+    target_link_libraries(interpreter_smoke PRIVATE gbarecomp_armv4t)
+    add_test(NAME interpreter_smoke COMMAND interpreter_smoke)
+
+    add_executable(armv4t_tests tests/armv4t/test_main.cpp)
+    target_link_libraries(armv4t_tests PRIVATE gbarecomp_armv4t)
+    add_test(NAME armv4t_tests COMMAND armv4t_tests)
+
+    add_executable(thumb_tests tests/thumb/test_main.cpp)
+    target_link_libraries(thumb_tests PRIVATE gbarecomp_armv4t)
+    add_test(NAME thumb_tests COMMAND thumb_tests)
+
+    add_gbarecomp_runtime_stack_test(bus_tests tests/bus/test_main.cpp)
+    add_gbarecomp_runtime_stack_test(dma_tests tests/dma/test_main.cpp)
+
+    add_executable(timer_tests tests/timers/test_main.cpp)
+    target_link_libraries(timer_tests PRIVATE gbarecomp_gba)
+    add_test(NAME timer_tests COMMAND timer_tests)
+
+    add_executable(irq_tests tests/irq/test_main.cpp)
+    target_link_libraries(irq_tests PRIVATE gbarecomp_gba)
+    add_test(NAME irq_tests COMMAND irq_tests)
+
+    add_executable(ppu_smoke_tests tests/ppu_smoke/test_main.cpp)
+    target_include_directories(ppu_smoke_tests PRIVATE src/runtime src/debug)
+    target_link_libraries(ppu_smoke_tests PRIVATE gbarecomp_gba)
+    if(MSVC)
+        target_link_options(ppu_smoke_tests PRIVATE /STACK:16777216)
+    elseif(MINGW OR WIN32)
+        target_link_options(ppu_smoke_tests PRIVATE -Wl,--stack,16777216)
+    endif()
+    add_test(NAME ppu_smoke_tests COMMAND ppu_smoke_tests)
+
+    add_executable(presentation_layout_tests tests/presentation_layout/test_main.cpp)
+    target_include_directories(presentation_layout_tests PRIVATE src/runtime)
+    add_test(NAME presentation_layout_tests COMMAND presentation_layout_tests)
+
+    # P6 differential-gate primitives (offline; full-RAM snapshot/restore/diff).
+    add_executable(heal_gate_tests
+        tests/heal_gate/heal_gate_test.cpp
+        tests/heal_gate/runtime_stubs.cpp)
+    target_link_libraries(heal_gate_tests PRIVATE gbarecomp_heal_gate)
+    add_test(NAME heal_gate_tests COMMAND heal_gate_tests)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # codegen_tests — L1 per-IrOp diff harness.
+    #
+    # Architecture:
+    #   1. tests/codegen/test_cases.cpp lists per-IrOp test cases.
+    #   2. gen_codegen_tests.exe reads that list, invokes the same
+    #      ArmCodegen used by tools/gba_recompile, and emits one C
+    #      function per case into ${CMAKE_BINARY_DIR}/codegen_tests/
+    #      test_funcs.cpp.
+    #   3. codegen_tests.exe links test_main.cpp + test_cases.cpp +
+    #      stubs.cpp + the generated test_funcs.cpp against
+    #      gbarecomp_armv4t. It runs both the interpreter and the
+    #      generated function per case and diffs the resulting state.
+    #
+    # Per PRINCIPLES.md "Interpreter is informative, never load-bearing":
+    # the interpreter is the diff-oracle, never a runtime fallback. Any
+    # divergence is a real codegen bug to fix in arm_codegen.cpp.
+    # ─────────────────────────────────────────────────────────────────────
+    add_executable(gen_codegen_tests
+        tests/codegen/gen_codegen_tests.cpp
+        tests/codegen/test_cases.cpp
+    )
+    target_include_directories(gen_codegen_tests PRIVATE
+        tests/codegen
+        src/armv4t)
+    target_link_libraries(gen_codegen_tests PRIVATE gbarecomp_armv4t)
+
+    set(CODEGEN_TESTS_OUTDIR
+        ${CMAKE_CURRENT_BINARY_DIR}/codegen_tests)
+    set(CODEGEN_TESTS_GENFILE
+        ${CODEGEN_TESTS_OUTDIR}/test_funcs.cpp)
+
+    file(MAKE_DIRECTORY ${CODEGEN_TESTS_OUTDIR})
+
     add_custom_command(
-        OUTPUT  ${TEST_ROM_ARM_DISPATCH} ${TEST_ROM_ARM_BODIES}
-                ${TEST_ROM_ARM_HEADER}
-        COMMAND $<TARGET_FILE:gba_recompile>
-                --rom ${GBA_SUITE_ROOT}/arm/arm.gba
-                --entry 0x080000C0
-                --codegen-shards 2
-                --out ${TEST_ROM_ARM_OUTDIR}
-        DEPENDS gba_recompile
-                ${GBA_SUITE_ROOT}/arm/arm.gba
-        COMMENT "Recompiling gba-suite arm.gba"
+        OUTPUT  ${CODEGEN_TESTS_GENFILE}
+        COMMAND gen_codegen_tests ${CODEGEN_TESTS_GENFILE}
+        DEPENDS gen_codegen_tests
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/codegen/test_cases.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/codegen/test_cases.h
+        COMMENT "Emitting L1 codegen test functions"
         VERBATIM
     )
 
-    add_executable(test_rom_arm
-        tools/test_rom_runner/main.cpp
-        ${TEST_ROM_ARM_DISPATCH}
-        ${TEST_ROM_ARM_BODIES}
+    add_executable(codegen_tests
+        tests/codegen/test_main.cpp
+        tests/codegen/test_cases.cpp
+        tests/codegen/stubs.cpp
+        ${CODEGEN_TESTS_GENFILE}
     )
-    target_include_directories(test_rom_arm PRIVATE
-        ${TEST_ROM_ARM_OUTDIR}
+    target_include_directories(codegen_tests PRIVATE
+        tests/codegen
         src/armv4t)
-    target_link_gbarecomp_runtime_stack(test_rom_arm)
-    add_test(NAME test_rom_arm COMMAND test_rom_arm
-        ${GBA_SUITE_ROOT}/arm/arm.gba)
-else()
-    message(STATUS "gbarecomp: gba-suite arm.gba not found; "
-                   "skipping test_rom_arm target")
-endif()
+    target_link_libraries(codegen_tests PRIVATE gbarecomp_armv4t)
+    add_test(NAME codegen_tests COMMAND codegen_tests)
 
-# Recompile thumb.gba at build time.
-set(TEST_ROM_THUMB_OUTDIR ${CMAKE_CURRENT_BINARY_DIR}/test_rom_thumb_gen)
-set(TEST_ROM_THUMB_DISPATCH ${TEST_ROM_THUMB_OUTDIR}/dispatch_table.cpp)
-set(TEST_ROM_THUMB_BODIES
-    ${TEST_ROM_THUMB_OUTDIR}/recompiled_000.cpp
-    ${TEST_ROM_THUMB_OUTDIR}/recompiled_001.cpp)
-set(TEST_ROM_THUMB_HEADER   ${TEST_ROM_THUMB_OUTDIR}/recompiled.h)
-file(MAKE_DIRECTORY ${TEST_ROM_THUMB_OUTDIR})
-
-if(EXISTS ${GBA_SUITE_ROOT}/thumb/thumb.gba)
-    add_custom_command(
-        OUTPUT  ${TEST_ROM_THUMB_DISPATCH} ${TEST_ROM_THUMB_BODIES}
-                ${TEST_ROM_THUMB_HEADER}
-        COMMAND $<TARGET_FILE:gba_recompile>
-                --rom ${GBA_SUITE_ROOT}/thumb/thumb.gba
-                --entry 0x080000C0
-                --codegen-shards 2
-                --out ${TEST_ROM_THUMB_OUTDIR}
-        DEPENDS gba_recompile
-                ${GBA_SUITE_ROOT}/thumb/thumb.gba
-        COMMENT "Recompiling gba-suite thumb.gba"
-        VERBATIM
-    )
-
-    add_executable(test_rom_thumb
-        tools/test_rom_runner/main.cpp
-        ${TEST_ROM_THUMB_DISPATCH}
-        ${TEST_ROM_THUMB_BODIES}
-    )
-    target_include_directories(test_rom_thumb PRIVATE
-        ${TEST_ROM_THUMB_OUTDIR}
-        src/armv4t)
-    target_link_gbarecomp_runtime_stack(test_rom_thumb)
-    add_test(NAME test_rom_thumb COMMAND test_rom_thumb
-        ${GBA_SUITE_ROOT}/thumb/thumb.gba)
-else()
-    message(STATUS "gbarecomp: gba-suite thumb.gba not found; "
-                   "skipping test_rom_thumb target")
-endif()
-
-# bios_smoke — Phase 2.1 canary. Loads bios/gba_bios.bin, runs the
-# interpreter from PC=0 for N instructions, prints a trace.
-add_executable(bios_smoke tools/bios_smoke/main.cpp
-                          tools/bios_smoke/dispatch_stub.cpp)
-target_link_gbarecomp_runtime_stack(bios_smoke)
-if(WIN32 OR MSYS)
-    target_link_libraries(bios_smoke PRIVATE ws2_32)
-endif()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# tests — per-subsystem. Run with ctest.
-# ─────────────────────────────────────────────────────────────────────────────
-enable_testing()
-
-add_test(NAME runtime_monolith_guard
-    COMMAND ${CMAKE_COMMAND}
-        -DGBARECOMP_RUNTIME_CMAKE=${CMAKE_CURRENT_BINARY_DIR}/runtime.cmake
-        -DGBARECOMP_TEST_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/runtime_monolith_guard
-        -DGBARECOMP_TEST_BINARY=${CMAKE_CURRENT_BINARY_DIR}/runtime_monolith_guard_test
-        -DGBARECOMP_TEST_GENERATOR=${CMAKE_GENERATOR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/assert_runtime_monolith_guard.cmake)
-
-add_executable(decoder_smoke tests/armv4t/decoder_smoke.cpp)
-target_link_libraries(decoder_smoke PRIVATE gbarecomp_armv4t)
-add_test(NAME decoder_smoke COMMAND decoder_smoke)
-
-add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
-target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
-add_test(NAME function_finder_tests COMMAND function_finder_tests)
-
-add_executable(codegen_shards_tests tests/recompile/codegen_shards_test.cpp)
-target_link_libraries(codegen_shards_tests PRIVATE gbarecomp_recompile_core)
-add_test(NAME codegen_shards_tests COMMAND codegen_shards_tests)
-
-# Self-heal proposal clustering — pure logic, links only the standalone
-# clustering TU (no runtime/bus/overlay dependencies).
-add_executable(selfheal_cluster_test
-    tests/selfheal/cluster_test.cpp
-    src/runtime/self_heal_cluster.cpp)
-target_include_directories(selfheal_cluster_test PRIVATE src/runtime)
-add_test(NAME selfheal_cluster_test COMMAND selfheal_cluster_test)
-
-add_executable(interpreter_smoke tests/armv4t/interpreter_smoke.cpp)
-target_link_libraries(interpreter_smoke PRIVATE gbarecomp_armv4t)
-add_test(NAME interpreter_smoke COMMAND interpreter_smoke)
-
-add_executable(armv4t_tests tests/armv4t/test_main.cpp)
-target_link_libraries(armv4t_tests PRIVATE gbarecomp_armv4t)
-add_test(NAME armv4t_tests COMMAND armv4t_tests)
-
-add_executable(thumb_tests tests/thumb/test_main.cpp)
-target_link_libraries(thumb_tests PRIVATE gbarecomp_armv4t)
-add_test(NAME thumb_tests COMMAND thumb_tests)
-
-add_gbarecomp_runtime_stack_test(bus_tests tests/bus/test_main.cpp)
-add_gbarecomp_runtime_stack_test(dma_tests tests/dma/test_main.cpp)
-
-add_executable(timer_tests tests/timers/test_main.cpp)
-target_link_libraries(timer_tests PRIVATE gbarecomp_gba)
-add_test(NAME timer_tests COMMAND timer_tests)
-
-add_executable(irq_tests tests/irq/test_main.cpp)
-target_link_libraries(irq_tests PRIVATE gbarecomp_gba)
-add_test(NAME irq_tests COMMAND irq_tests)
-
-add_executable(ppu_smoke_tests tests/ppu_smoke/test_main.cpp)
-target_include_directories(ppu_smoke_tests PRIVATE src/runtime src/debug)
-target_link_libraries(ppu_smoke_tests PRIVATE gbarecomp_gba)
-if(MSVC)
-    target_link_options(ppu_smoke_tests PRIVATE /STACK:16777216)
-elseif(MINGW OR WIN32)
-    target_link_options(ppu_smoke_tests PRIVATE -Wl,--stack,16777216)
-endif()
-add_test(NAME ppu_smoke_tests COMMAND ppu_smoke_tests)
-
-add_executable(presentation_layout_tests tests/presentation_layout/test_main.cpp)
-target_include_directories(presentation_layout_tests PRIVATE src/runtime)
-add_test(NAME presentation_layout_tests COMMAND presentation_layout_tests)
-
-# P6 differential-gate primitives (offline; full-RAM snapshot/restore/diff).
-add_executable(heal_gate_tests
-    tests/heal_gate/heal_gate_test.cpp
-    tests/heal_gate/runtime_stubs.cpp)
-target_link_libraries(heal_gate_tests PRIVATE gbarecomp_heal_gate)
-add_test(NAME heal_gate_tests COMMAND heal_gate_tests)
-
-# ─────────────────────────────────────────────────────────────────────
-# codegen_tests — L1 per-IrOp diff harness.
-#
-# Architecture:
-#   1. tests/codegen/test_cases.cpp lists per-IrOp test cases.
-#   2. gen_codegen_tests.exe reads that list, invokes the same
-#      ArmCodegen used by tools/gba_recompile, and emits one C
-#      function per case into ${CMAKE_BINARY_DIR}/codegen_tests/
-#      test_funcs.cpp.
-#   3. codegen_tests.exe links test_main.cpp + test_cases.cpp +
-#      stubs.cpp + the generated test_funcs.cpp against
-#      gbarecomp_armv4t. It runs both the interpreter and the
-#      generated function per case and diffs the resulting state.
-#
-# Per PRINCIPLES.md "Interpreter is informative, never load-bearing":
-# the interpreter is the diff-oracle, never a runtime fallback. Any
-# divergence is a real codegen bug to fix in arm_codegen.cpp.
-# ─────────────────────────────────────────────────────────────────────
-add_executable(gen_codegen_tests
-    tests/codegen/gen_codegen_tests.cpp
-    tests/codegen/test_cases.cpp
-)
-target_include_directories(gen_codegen_tests PRIVATE
-    tests/codegen
-    src/armv4t)
-target_link_libraries(gen_codegen_tests PRIVATE gbarecomp_armv4t)
-
-set(CODEGEN_TESTS_OUTDIR
-    ${CMAKE_CURRENT_BINARY_DIR}/codegen_tests)
-set(CODEGEN_TESTS_GENFILE
-    ${CODEGEN_TESTS_OUTDIR}/test_funcs.cpp)
-
-file(MAKE_DIRECTORY ${CODEGEN_TESTS_OUTDIR})
-
-add_custom_command(
-    OUTPUT  ${CODEGEN_TESTS_GENFILE}
-    COMMAND gen_codegen_tests ${CODEGEN_TESTS_GENFILE}
-    DEPENDS gen_codegen_tests
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/codegen/test_cases.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/codegen/test_cases.h
-    COMMENT "Emitting L1 codegen test functions"
-    VERBATIM
-)
-
-add_executable(codegen_tests
-    tests/codegen/test_main.cpp
-    tests/codegen/test_cases.cpp
-    tests/codegen/stubs.cpp
-    ${CODEGEN_TESTS_GENFILE}
-)
-target_include_directories(codegen_tests PRIVATE
-    tests/codegen
-    src/armv4t)
-target_link_libraries(codegen_tests PRIVATE gbarecomp_armv4t)
-add_test(NAME codegen_tests COMMAND codegen_tests)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# selfheal_stage2_bios_identical — Stage-2 GFP1 byte-identity gate. Proves a
-# healed-to-native BIOS function (0xBA4 exclude fixture) executes instruction-
-# for-instruction identically to the fully-static corpus (static == bridge ==
-# heal_cold == heal_warm). Heavy + needs the gitignored ROM/BIOS + a built
-# MinishCapRecomp, so it is OPT-IN: pass -DGBARECOMP_SELFHEAL_MC_DIR=<MC dir>.
-# Skips (ctest "Skipped") if the assets are absent.
-# ─────────────────────────────────────────────────────────────────────────────
-if(GBARECOMP_SELFHEAL_MC_DIR)
-    find_program(BASH_EXE bash HINTS C:/msys64/usr/bin /usr/bin)
-    if(BASH_EXE)
-        add_test(NAME selfheal_stage2_bios_identical
-            COMMAND ${BASH_EXE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/selfheal/stage2_bios_identical.sh)
-        set_tests_properties(selfheal_stage2_bios_identical PROPERTIES
-            ENVIRONMENT "GBARECOMP_ROOT=${CMAKE_CURRENT_SOURCE_DIR};MC_DIR=${GBARECOMP_SELFHEAL_MC_DIR}"
-            SKIP_RETURN_CODE 77
-            TIMEOUT 2400)
-        # selfheal_coverage_sweep — drives the built MC from every savestate with
-        # the self-heal recompiler on and asserts FULLY_STATIC for each scene
-        # (the doctrine's "done"). Surfaces remaining finder gaps; doubles as a
-        # coverage regression guard. Same opt-in / SKIP-77 contract.
-        add_test(NAME selfheal_coverage_sweep
-            COMMAND ${BASH_EXE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/selfheal/coverage_sweep.sh)
-        set_tests_properties(selfheal_coverage_sweep PROPERTIES
-            ENVIRONMENT "GBARECOMP_ROOT=${CMAKE_CURRENT_SOURCE_DIR};MC_DIR=${GBARECOMP_SELFHEAL_MC_DIR}"
-            SKIP_RETURN_CODE 77
-            TIMEOUT 2400)
-    else()
-        message(STATUS "gbarecomp: bash not found; skipping "
-                       "selfheal_stage2_bios_identical + selfheal_coverage_sweep")
+    # ─────────────────────────────────────────────────────────────────────────────
+    # selfheal_stage2_bios_identical — Stage-2 GFP1 byte-identity gate. Proves a
+    # healed-to-native BIOS function (0xBA4 exclude fixture) executes instruction-
+    # for-instruction identically to the fully-static corpus (static == bridge ==
+    # heal_cold == heal_warm). Heavy + needs the gitignored ROM/BIOS + a built
+    # MinishCapRecomp, so it is OPT-IN: pass -DGBARECOMP_SELFHEAL_MC_DIR=<MC dir>.
+    # Skips (ctest "Skipped") if the assets are absent.
+    # ─────────────────────────────────────────────────────────────────────────────
+    if(GBARECOMP_SELFHEAL_MC_DIR)
+        find_program(BASH_EXE bash HINTS C:/msys64/usr/bin /usr/bin)
+        if(BASH_EXE)
+            add_test(NAME selfheal_stage2_bios_identical
+                COMMAND ${BASH_EXE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/selfheal/stage2_bios_identical.sh)
+            set_tests_properties(selfheal_stage2_bios_identical PROPERTIES
+                ENVIRONMENT "GBARECOMP_ROOT=${CMAKE_CURRENT_SOURCE_DIR};MC_DIR=${GBARECOMP_SELFHEAL_MC_DIR}"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 2400)
+            # selfheal_coverage_sweep — drives the built MC from every savestate with
+            # the self-heal recompiler on and asserts FULLY_STATIC for each scene
+            # (the doctrine's "done"). Surfaces remaining finder gaps; doubles as a
+            # coverage regression guard. Same opt-in / SKIP-77 contract.
+            add_test(NAME selfheal_coverage_sweep
+                COMMAND ${BASH_EXE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/selfheal/coverage_sweep.sh)
+            set_tests_properties(selfheal_coverage_sweep PROPERTIES
+                ENVIRONMENT "GBARECOMP_ROOT=${CMAKE_CURRENT_SOURCE_DIR};MC_DIR=${GBARECOMP_SELFHEAL_MC_DIR}"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 2400)
+        else()
+            message(STATUS "gbarecomp: bash not found; skipping "
+                           "selfheal_stage2_bios_identical + selfheal_coverage_sweep")
+        endif()
     endif()
-endif()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Oracle binary — opt-in (-DGBARECOMP_BUILD_ORACLE=ON). Embeds libmgba
-# (MPL-2.0). Per PRINCIPLES.md the native build has zero copyleft deps;
-# the oracle binary is the ONLY place libmgba may be linked, and it
-# runs as a SEPARATE PROCESS over TCP.
-# ─────────────────────────────────────────────────────────────────────────────
-option(GBARECOMP_BUILD_ORACLE
-       "Build the mGBA-backed oracle (requires third_party/mgba/build/libmgba.a)"
-       OFF)
-if(GBARECOMP_BUILD_ORACLE)
-    add_subdirectory(oracle)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Oracle binary — opt-in (-DGBARECOMP_BUILD_ORACLE=ON). Embeds libmgba
+    # (MPL-2.0). Per PRINCIPLES.md the native build has zero copyleft deps;
+    # the oracle binary is the ONLY place libmgba may be linked, and it
+    # runs as a SEPARATE PROCESS over TCP.
+    # ─────────────────────────────────────────────────────────────────────────────
+    option(GBARECOMP_BUILD_ORACLE
+           "Build the mGBA-backed oracle (requires third_party/mgba/build/libmgba.a)"
+           OFF)
+    if(GBARECOMP_BUILD_ORACLE)
+        add_subdirectory(oracle)
+    endif()
+
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────

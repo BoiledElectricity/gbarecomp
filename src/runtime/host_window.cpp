@@ -309,6 +309,9 @@ struct Backend {
     int          fps_presents = 0;
     // MC-WS-002: always-on per-present timing/scanout ring (see above).
     PresentCadence cadence;
+
+    // ---- game controllers (see pad_keyinput) ------------------------------
+    std::vector<SDL_GameController*> pads;
 };
 
 // GBA KEYINPUT bit order: 0=A 1=B 2=Sel 3=Sta 4=Right 5=Left 6=Up 7=Down 8=R 9=L.
@@ -597,6 +600,113 @@ HostWindow::~HostWindow() {
     close();
 }
 
+namespace {
+
+// How the fixed 240x160 frame is fitted to the window.
+//   fit     — whole picture, correct aspect, bars on the short axis (default)
+//   stretch — fills the window, aspect distorted
+//   zoom    — fills the window at correct aspect, overflow cropped
+enum class PresentMode { Fit, Stretch, Zoom };
+
+PresentMode present_mode() {
+    static const PresentMode mode = [] {
+        const char* e = std::getenv("GBARECOMP_PRESENT_MODE");
+        if (e) {
+            if (std::strcmp(e, "stretch") == 0) return PresentMode::Stretch;
+            if (std::strcmp(e, "zoom") == 0)    return PresentMode::Zoom;
+            if (std::strcmp(e, "fit") == 0)     return PresentMode::Fit;
+        }
+        return PresentMode::Fit;
+    }();
+    return mode;
+}
+
+// Largest centered rect at the source aspect that COVERS the drawable; the
+// overflow falls outside the window and is cropped.
+SDL_Rect cover_rect(int dw, int dh, int sw, int sh) {
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return {0, 0, dw, dh};
+    const double scale = std::max(static_cast<double>(dw) / sw,
+                                  static_cast<double>(dh) / sh);
+    const int w = static_cast<int>(sw * scale + 0.5);
+    const int h = static_cast<int>(sh * scale + 0.5);
+    return {(dw - w) / 2, (dh - h) / 2, w, h};
+}
+
+// Face-button convention follows mGBA and the wider GB/GBA emulator default:
+// SDL south ("A") is GBA A. GBARECOMP_PAD_SWAP_AB=1 selects the positional
+// reading instead, where GBA A sits on the east button.
+bool pad_swap_ab() {
+    static const bool swap = [] {
+        const char* e = std::getenv("GBARECOMP_PAD_SWAP_AB");
+        return e && e[0] && e[0] != '0';
+    }();
+    return swap;
+}
+
+void pads_open_all(Backend* b) {
+    for (int i = 0; i < SDL_NumJoysticks(); ++i) {
+        if (!SDL_IsGameController(i)) continue;
+        if (SDL_GameController* gc = SDL_GameControllerOpen(i))
+            b->pads.push_back(gc);
+    }
+}
+
+void pads_close_all(Backend* b) {
+    for (SDL_GameController* gc : b->pads)
+        if (gc) SDL_GameControllerClose(gc);
+    b->pads.clear();
+}
+
+// Returns the held-key mask (bit set = pressed), in GBA KEYINPUT bit order.
+uint16_t pad_held(Backend* b) {
+    // A stick has to travel most of the way before it counts as a direction:
+    // the GBA d-pad is digital and a loose stick would fight the player.
+    constexpr int kStickDead   = 14000;
+    constexpr int kTriggerDead = 12000;
+
+    uint16_t held = 0;
+    for (SDL_GameController* gc : b->pads) {
+        if (!gc || !SDL_GameControllerGetAttached(gc)) continue;
+        auto down = [gc](SDL_GameControllerButton btn) {
+            return SDL_GameControllerGetButton(gc, btn) != 0;
+        };
+        auto axis = [gc](SDL_GameControllerAxis ax) {
+            return static_cast<int>(SDL_GameControllerGetAxis(gc, ax));
+        };
+
+        const bool south = down(SDL_CONTROLLER_BUTTON_A);
+        const bool east  = down(SDL_CONTROLLER_BUTTON_B);
+        if (pad_swap_ab() ? east : south)  held |= 1u << 0;  // GBA A
+        if (pad_swap_ab() ? south : east)  held |= 1u << 1;  // GBA B
+
+        if (down(SDL_CONTROLLER_BUTTON_BACK))  held |= 1u << 2;  // Select
+        if (down(SDL_CONTROLLER_BUTTON_START)) held |= 1u << 3;  // Start
+
+        if (down(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) held |= 1u << 4;
+        if (down(SDL_CONTROLLER_BUTTON_DPAD_LEFT))  held |= 1u << 5;
+        if (down(SDL_CONTROLLER_BUTTON_DPAD_UP))    held |= 1u << 6;
+        if (down(SDL_CONTROLLER_BUTTON_DPAD_DOWN))  held |= 1u << 7;
+
+        const int lx = axis(SDL_CONTROLLER_AXIS_LEFTX);
+        const int ly = axis(SDL_CONTROLLER_AXIS_LEFTY);
+        if (lx >  kStickDead) held |= 1u << 4;
+        if (lx < -kStickDead) held |= 1u << 5;
+        if (ly < -kStickDead) held |= 1u << 6;
+        if (ly >  kStickDead) held |= 1u << 7;
+
+        // Shoulders or triggers, so handhelds that expose only one work.
+        if (down(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ||
+            axis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > kTriggerDead)
+            held |= 1u << 8;                                     // R
+        if (down(SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ||
+            axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT) > kTriggerDead)
+            held |= 1u << 9;                                     // L
+    }
+    return held;
+}
+
+}  // namespace
+
 bool HostWindow::is_available() { return true; }
 
 bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
@@ -622,6 +732,15 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
         }
     }
 
+    if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
+        // Non-fatal: keyboard and the on-screen pad still work without it.
+        if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+            std::fprintf(stderr,
+                         "host_window: SDL_InitSubSystem(GAMECONTROLLER) failed: %s\n",
+                         SDL_GetError());
+        }
+    }
+
     auto* b = new Backend{};
     b->base_w = base_w;
     b->base_h = base_h;
@@ -630,6 +749,7 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     b->linear_filter = linear_filter;
     b->scale = scale;
     b->title = title ? title : "gbarecomp";
+    pads_open_all(b);
     std::memcpy(b->bind_sc, kDefaultBinds, sizeof(kDefaultBinds));
     for (int h = 0; h < HK_COUNT; ++h)
         b->hotkeys[h] = parse_hotkey(kHotkeyDefaults[h]);
@@ -716,8 +836,14 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
         SDL_SetRenderDrawColor(b->renderer, 0, 0, 0, 255);
     } else {
         // Non-opting games retain the historical fixed 240x160 SDL logical
-        // renderer, including its window flags and copy path.
-        SDL_RenderSetLogicalSize(b->renderer, base_w, base_h);
+        // renderer, including its window flags and copy path. A fill mode
+        // does its own destination maths, so the logical size — which is what
+        // letterboxes — stays off.
+        if (present_mode() == PresentMode::Fit) {
+            SDL_RenderSetLogicalSize(b->renderer, base_w, base_h);
+        } else {
+            SDL_SetRenderDrawColor(b->renderer, 0, 0, 0, 255);
+        }
     }
 
     b->texture = SDL_CreateTexture(b->renderer,
@@ -860,6 +986,7 @@ void HostWindow::close() {
 #if defined(GBARECOMP_RUNTIME_UI)
     runtime_imgui_shutdown(b);
 #endif
+    pads_close_all(b);
     if (b->texture)   SDL_DestroyTexture(b->texture);
     if (b->renderer)  SDL_DestroyRenderer(b->renderer);
     if (b->window)    SDL_DestroyWindow(b->window);
@@ -937,7 +1064,17 @@ void HostWindow::present(const uint8_t* rgb888) {
     SDL_UpdateTexture(b->texture, nullptr, rgb888, b->base_w * 3);
     SDL_RenderClear(b->renderer);
     if (!b->expanded_view && !b->resize_driven_view) {
-        SDL_RenderCopy(b->renderer, b->texture, nullptr, nullptr);
+        if (present_mode() == PresentMode::Zoom) {
+            int dw = 0, dh = 0;
+            if (SDL_GetRendererOutputSize(b->renderer, &dw, &dh) != 0)
+                SDL_GetWindowSize(b->window, &dw, &dh);
+            const SDL_Rect dst = cover_rect(dw, dh, b->base_w, b->base_h);
+            SDL_RenderCopy(b->renderer, b->texture, nullptr, &dst);
+        } else {
+            // Fit: SDL's logical size already letterboxes into the target.
+            // Stretch: a null destination fills it.
+            SDL_RenderCopy(b->renderer, b->texture, nullptr, nullptr);
+        }
     } else {
         int drawable_w = 0;
         int drawable_h = 0;
@@ -1139,7 +1276,11 @@ HostWindow::Events HostWindow::pump() {
         }
         if (runtime_ui_event(b->runtime_ui, e)) continue;
 #endif
-        if (e.type == SDL_QUIT) {
+        if (e.type == SDL_CONTROLLERDEVICEADDED ||
+            e.type == SDL_CONTROLLERDEVICEREMOVED) {
+            pads_close_all(b);
+            pads_open_all(b);
+        } else if (e.type == SDL_QUIT) {
             ev.quit = true;
         } else if (e.type == SDL_WINDOWEVENT &&
                    e.window.event == SDL_WINDOWEVENT_CLOSE) {
@@ -1187,6 +1328,7 @@ HostWindow::Events HostWindow::pump() {
         if (sc != SDL_SCANCODE_UNKNOWN && ks[sc])
             keys &= static_cast<uint16_t>(~(1u << bit));
     }
+    keys &= static_cast<uint16_t>(~pad_held(b));
     ev.keyinput = keys;
 #if defined(GBARECOMP_RUNTIME_UI)
     if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui))

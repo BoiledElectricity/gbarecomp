@@ -64,6 +64,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <pthread.h>
+#include <unistd.h>
+#endif
 #include <vector>
 
 // Authoritative IRQ-entry counter, incremented in runtime_irq (runtime_arm.cpp)
@@ -893,7 +899,77 @@ extern "C" unsigned g_ws_extra_left  = 0;
 extern "C" unsigned g_ws_extra_right = 0;
 extern "C" unsigned g_ws_view_width  = 240;
 
+#if defined(__ANDROID__)
+static int run_game_impl(int argc, char** argv, const RunOptions& opts);
+
+// Android drops a process's stdout/stderr on the floor, which would silence
+// every diagnostic the runtime prints — including the one telling the player
+// where to put the BIOS. Pump both through a pipe into logcat instead.
+static void android_redirect_stdio() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+
+    int fds[2];
+    if (pipe(fds) != 0) return;
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+    close(fds[1]);
+
+    std::thread([read_fd = fds[0]]() {
+        std::string line;
+        char buf[512];
+        for (;;) {
+            const ssize_t n = read(read_fd, buf, sizeof(buf));
+            if (n <= 0) break;
+            for (ssize_t i = 0; i < n; ++i) {
+                if (buf[i] == '\n') {
+                    __android_log_write(ANDROID_LOG_INFO, "gbarecomp",
+                                        line.c_str());
+                    line.clear();
+                } else if (buf[i] != '\r') {
+                    line.push_back(buf[i]);
+                }
+            }
+        }
+    }).detach();
+}
+
+// SDLActivity runs SDL_main on a Java-created thread with a ~1 MB stack, which
+// deep guest->host recompiled call chains blow through. Desktop builds reserve
+// the equivalent at link time (/STACK, -Wl,--stack); here it has to be a
+// thread we create ourselves.
 int run_game(int argc, char** argv, const RunOptions& opts) {
+    android_redirect_stdio();
+
+    struct Args {
+        int argc; char** argv; const RunOptions* opts; int rc;
+    } a{argc, argv, &opts, 1};
+
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return run_game_impl(argc, argv, opts);
+    pthread_attr_setstacksize(&attr, 256u * 1024u * 1024u);
+
+    auto entry = [](void* p) -> void* {
+        Args* a = static_cast<Args*>(p);
+        a->rc = run_game_impl(a->argc, a->argv, *a->opts);
+        return nullptr;
+    };
+
+    pthread_t tid;
+    int err = pthread_create(&tid, &attr, entry, &a);
+    pthread_attr_destroy(&attr);
+    if (err != 0) return run_game_impl(argc, argv, opts);
+    pthread_join(tid, nullptr);
+    return a.rc;
+}
+
+static int run_game_impl(int argc, char** argv, const RunOptions& opts) {
+#else
+int run_game(int argc, char** argv, const RunOptions& opts) {
+#endif
     // Game runners install this before entering run_game(). Clear it on every
     // return path so a later game launched in the same process cannot call a
     // stale game-specific copied-code dispatcher.

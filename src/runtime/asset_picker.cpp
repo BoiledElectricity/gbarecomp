@@ -18,13 +18,17 @@
 #include <commdlg.h>
 #endif
 
+#if defined(__ANDROID__)
+#include <SDL.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace gbarecomp {
 
 namespace {
 
-std::string exe_dir_from(const std::string& argv0) {
+[[maybe_unused]] std::string exe_dir_from(const std::string& argv0) {
     if (argv0.empty()) return ".";
     fs::path p(argv0);
     if (p.has_parent_path()) {
@@ -172,12 +176,48 @@ AssetResult load_and_validate(const std::string& path,
     return r;
 }
 
+#if defined(__ANDROID__)
+
+// The app's external files dir (/sdcard/Android/data/<pkg>/files) — visible to
+// any file manager or a USB host, and writable with no runtime permission.
+std::string android_asset_dir() {
+    const char* p = SDL_AndroidGetExternalStoragePath();
+    return (p && *p) ? std::string(p) : std::string(".");
+}
+
+// Android reaches no file dialog from C, so assets are identified by content
+// instead: any file in the asset dir of the right size, preferring an exact
+// SHA-1 hit so a folder holding several ROMs still resolves to the right one.
+std::string scan_for_asset(const AssetSpec& spec) {
+    std::error_code ec;
+    fs::directory_iterator it(android_asset_dir(), ec);
+    if (ec) return {};
+    std::string size_match;
+    for (const auto& entry : it) {
+        if (!entry.is_regular_file(ec) || ec) continue;
+        if (spec.expected_size != 0 &&
+            entry.file_size(ec) != spec.expected_size) continue;
+        std::string path = entry.path().string();
+        AssetResult r = load_and_validate(path, spec);
+        if (!r.ok) continue;
+        if (r.warning.empty()) return path;
+        if (size_match.empty()) size_match = std::move(path);
+    }
+    return size_match;
+}
+
+#endif  // __ANDROID__
+
 }  // namespace
 
 AssetResult resolve_asset(const std::string& argv_path,
                           const AssetSpec& spec,
                           const std::string& argv0) {
+#if defined(__ANDROID__)
+    const std::string exe_dir = android_asset_dir();
+#else
     const std::string exe_dir = exe_dir_from(argv0);
+#endif
     const std::string cache = cache_path(exe_dir, spec.cache_filename);
 
     // 1. Explicit argv path: if it loads and validates, take it (cache
@@ -237,6 +277,21 @@ AssetResult resolve_asset(const std::string& argv_path,
         write_cache(cache, picked);
         return r;
     }
+#elif defined(__ANDROID__)
+    {
+        const std::string found = scan_for_asset(spec);
+        if (!found.empty()) {
+            auto r = load_and_validate(found, spec);
+            if (r.ok) {
+                write_cache(cache, found);
+                return r;
+            }
+        }
+    }
+    AssetResult r;
+    r.error = std::string(spec.display_name) + ": not found. Copy it into\n  " +
+              android_asset_dir() + "\nand relaunch.";
+    return r;
 #else
     AssetResult r;
     r.error = std::string(spec.display_name) +
