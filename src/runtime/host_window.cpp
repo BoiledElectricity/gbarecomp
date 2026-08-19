@@ -2,6 +2,9 @@
 
 #include "host_window.h"
 
+// g_ws_pillarbox: the scene gate's "this screen has no world to widen into".
+#include "gba_ppu.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -1063,7 +1066,19 @@ void HostWindow::present(const uint8_t* rgb888) {
     }
     SDL_UpdateTexture(b->texture, nullptr, rgb888, b->base_w * 3);
     SDL_RenderClear(b->renderer);
-    if (!b->expanded_view && !b->resize_driven_view) {
+    // Scenes with no world to widen into (title, menus, battles) have their
+    // margins failed closed by the scene gate. Presenting that frame as-is
+    // means black bars, so present only the faithful centre and let it fill:
+    // stretched 240 beats a picture that does not reach the edges.
+    if ((b->expanded_view || b->resize_driven_view) && gba::g_ws_pillarbox &&
+        b->base_w > 240) {
+        const SDL_Rect src = {(b->base_w - 240) / 2, 0, 240, b->base_h};
+        int lw = 0, lh = 0;
+        SDL_RenderGetLogicalSize(b->renderer, &lw, &lh);
+        if (lw > 0 || lh > 0) SDL_RenderSetLogicalSize(b->renderer, 0, 0);
+        SDL_RenderCopy(b->renderer, b->texture, &src, nullptr);
+        if (lw > 0 || lh > 0) SDL_RenderSetLogicalSize(b->renderer, lw, lh);
+    } else if (!b->expanded_view && !b->resize_driven_view) {
         if (present_mode() == PresentMode::Zoom) {
             int dw = 0, dh = 0;
             if (SDL_GetRendererOutputSize(b->renderer, &dw, &dh) != 0)
@@ -1102,6 +1117,26 @@ void HostWindow::present(const uint8_t* rgb888) {
 #endif
     // MC-WS-002: time the present itself (vsync blocks here — or doesn't)
     // and stamp the DWM refresh counter into the always-on cadence ring.
+    // One-shot presentation report. Not gated on quiet: on Android there is no
+    // console to ask, and every theory about why the picture does not reach the
+    // edges needs these four numbers to settle.
+    {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            int ow = 0, oh = 0, lw = 0, lh = 0, ww = 0, wh = 0;
+            SDL_GetRendererOutputSize(b->renderer, &ow, &oh);
+            SDL_RenderGetLogicalSize(b->renderer, &lw, &lh);
+            SDL_GetWindowSize(b->window, &ww, &wh);
+            std::fprintf(stderr,
+                "host_window: present base=%dx%d window=%dx%d output=%dx%d "
+                "logical=%dx%d expanded=%d adaptive=%d pillarbox=%d\n",
+                b->base_w, b->base_h, ww, wh, ow, oh, lw, lh,
+                (int)b->expanded_view, (int)b->resize_driven_view,
+                gba::g_ws_pillarbox);
+            std::fflush(stderr);
+        }
+    }
     const uint64_t cad_qpc0 = SDL_GetPerformanceCounter();
     SDL_RenderPresent(b->renderer);
     b->cadence.record(cad_qpc0, SDL_GetPerformanceCounter(), b->fullscreen);

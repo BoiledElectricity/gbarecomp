@@ -1165,6 +1165,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (!args.window_set && HostWindow::is_available()) {
             args.window = true;
             args.quiet = true;
+#if defined(__ANDROID__)
+            // An Android activity owns the whole screen; there is no windowed
+            // mode and no command line to ask for one. Without this the
+            // adaptive view never engages, and a 3:2 image sits letterboxed in
+            // the middle of a 20:9 panel.
+            args.fullscreen = 1;
+            // Adaptive by default too. The panel aspect is whatever the device
+            // and its insets say — a 2400x1080 phone gave SDL a 2288x1080
+            // window — so a width picked from the spec sheet still leaves bars.
+            // The game still has to authorize it via RunOptions.
+            args.resize_view = true;
+#endif
         }
         // Headless fallback: one frame is enough to validate the runtime
         // came up. Explicit --window runs stay open-ended (let the user

@@ -37,6 +37,8 @@ bool     g_enabled = false;
 uint32_t g_dm_pc = 0;                      // DrawMetatileAt guest PC
 uint32_t g_tilemap_ptrs = 0;              // IWRAM addr of gBGTilemapBuffers1
 uint32_t g_mapheader = 0;                 // EWRAM addr of gMapHeader (.mapLayout @+0)
+extern "C" unsigned g_ws_extra_left;        // runtime: expanded columns per side
+extern "C" unsigned g_ws_extra_right;
 uint32_t g_gmain = 0;                      // IWRAM addr of gMain (callback2 @ +4)
 uint32_t g_cb2_overworld = 0;             // guest PC of CB2_Overworld (thumb, no |1)
 bool     g_active_mode = false;           // GBARECOMP_WS_SC_ACTIVE: per-frame fill
@@ -388,10 +390,23 @@ void ws_sidecar_active_fill() {
     g_cam_valid = true;
 
     // World-metatile region: MARGINS ONLY (the central 15 metatile columns come
-    // from the guest's own VRAM tilemap; the PPU reads those directly). Filling
-    // only the ~4 metatile columns each side cuts the synthetic-draw count ~3x.
+    // from the guest's own VRAM tilemap; the PPU reads those directly), which
+    // keeps the synthetic-draw count down.
+    //
+    // How far out to fill has to follow the actual view. This was a fixed 4
+    // metatiles — 64px, sized for a ~24px margin — so a wider view asked the
+    // provider for tiles that were never drawn and got stale cache instead:
+    // at 240+120/side the hit rate fell to 45% and the margins filled with
+    // whatever the slots last held.
     const int mtx0 = w0x >> 1, mty0 = w0y >> 1;
-    const int margin_mt = 4;  // > ceil(24px/16) per side; +1 lookahead
+    const unsigned extra_px = g_ws_extra_left > g_ws_extra_right
+                                ? g_ws_extra_left : g_ws_extra_right;
+    // +1 metatile of lookahead so a scroll that exposes a new column finds it
+    // already drawn rather than one frame late.
+    int margin_mt = static_cast<int>((extra_px + 15u) / 16u) + 1;
+    if (margin_mt < 4) margin_mt = 4;
+    const int kMaxMarginMt = (kCacheW / 2) - 16;   // stay inside the ring
+    if (margin_mt > kMaxMarginMt) margin_mt = kMaxMarginMt;
     const int mx_lo = mtx0 - margin_mt, mx_hi = mtx0 + 15 + margin_mt;
     const int my_lo = mty0 - 1,         my_hi = mty0 + 11;
 
