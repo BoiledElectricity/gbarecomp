@@ -1564,7 +1564,20 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     ws_provenance_init_from_env();
     // Step C margin sidecar — gated by the WIP kill-switch (force-disabled unless
     // GBARECOMP_WS_WIP=1) so the shipped build never arms the broken margin path.
-    if (ws_wip_enabled) ws_sidecar_init_from_env();
+    if (ws_wip_enabled) {
+        if (opts.ws_draw_metatile_pc && opts.ws_tilemap_ptrs) {
+            WsSidecarConfig sc;
+            sc.draw_metatile_pc = opts.ws_draw_metatile_pc;
+            sc.tilemap_ptrs     = opts.ws_tilemap_ptrs;
+            sc.mapheader        = opts.ws_mapheader;
+            sc.gmain            = opts.view_gate_addr ? opts.view_gate_addr - 4u : 0u;
+            sc.cb2_overworld    = opts.view_gate_value;
+            sc.curcoords        = opts.ws_curcoords;
+            ws_sidecar_init_from_config(sc);
+        } else {
+            ws_sidecar_init_from_env();
+        }
+    }
 
     // ── Recompiler exec gate ──────────────────────────────────────
     //

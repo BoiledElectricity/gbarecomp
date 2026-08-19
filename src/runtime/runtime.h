@@ -51,6 +51,14 @@ struct RunOptions {
     // game gets if it ships a provider but never declares the layers.
     int ws_authored_margin_layers = 0;
 
+    // Guest addresses the widescreen margin sidecar needs. Per-game facts, so
+    // the game supplies them instead of every launch carrying a row of
+    // GBARECOMP_WS_SC_* environment variables. Zero = do not arm.
+    std::uint32_t ws_draw_metatile_pc = 0;   // DrawMetatileAt
+    std::uint32_t ws_tilemap_ptrs     = 0;   // gBGTilemapBuffers1
+    std::uint32_t ws_mapheader        = 0;   // gMapHeader
+    std::uint32_t ws_curcoords        = 0;   // gObjectEvents[0].currentCoords
+
     std::uint32_t view_gate_addr  = 0;
     std::uint32_t view_gate_value = 0;
     std::uint32_t view_gate_mask  = 0xFFFFFFFEu;   // ignore the Thumb bit

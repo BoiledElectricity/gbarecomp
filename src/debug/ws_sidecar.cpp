@@ -230,6 +230,7 @@ extern "C" void ws_sidecar_fn_entry_hook(uint32_t pc) {
 
 extern "C" int ws_sidecar_provider_adapter(int bg, int hw_x, int screen_y,
                                            uint16_t* out_entry);  // fwd
+void ws_sidecar_arm();  // fwd: shared tail of both init paths
 
 void ws_sidecar_init_from_env() {
     if (g_enabled) return;
@@ -251,9 +252,33 @@ void ws_sidecar_init_from_env() {
     if (uint32_t cy = parse_hex_env("GBARECOMP_WS_SC_CENTERY")) g_center_y = (int)cy;
     if (uint32_t cx = parse_hex_env("GBARECOMP_WS_SC_C2X")) g_center_x_c2 = (int)cx;
     if (uint32_t cy = parse_hex_env("GBARECOMP_WS_SC_C2Y")) g_center_y_c2 = (int)cy;
+    ws_sidecar_arm();
+}
+
+void ws_sidecar_init_from_config(const WsSidecarConfig& cfg) {
+    if (g_enabled) return;
+    g_dm_pc = cfg.draw_metatile_pc & ~1u;
+    g_tilemap_ptrs = cfg.tilemap_ptrs;
+    g_mapheader = cfg.mapheader;
+    g_gmain = cfg.gmain;
+    g_cb2_overworld = cfg.cb2_overworld & ~1u;
+    g_curcoords = cfg.curcoords;
+    g_active_mode = cfg.active;
+    // Environment still wins, so a probe session can retune a live build.
+    if (const char* a = std::getenv("GBARECOMP_WS_SC_ACTIVE"))
+        g_active_mode = (a[0] && a[0] != '0');
+    if (const char* a = std::getenv("GBARECOMP_WS_SC_LOGDM"))
+        g_log_dm = (a[0] && a[0] != '0');
+    if (uint32_t cx = parse_hex_env("GBARECOMP_WS_SC_C2X")) g_center_x_c2 = (int)cx;
+    if (uint32_t cy = parse_hex_env("GBARECOMP_WS_SC_C2Y")) g_center_y_c2 = (int)cy;
+    ws_sidecar_arm();
+}
+
+void ws_sidecar_arm() {
+    if (g_enabled) return;
     if (!g_dm_pc || !g_tilemap_ptrs) {
-        std::fprintf(stderr, "[ws-sidecar] NOT armed: need "
-            "GBARECOMP_WS_SC_DRAWMETATILE and _TILEMAP_PTRS\n");
+        std::fprintf(stderr, "[ws-sidecar] NOT armed: need the DrawMetatileAt "
+            "PC and the gBGTilemapBuffers pointer\n");
         return;
     }
     std::memset(g_owner, 0, sizeof(g_owner));

@@ -49,6 +49,23 @@ bool ws_sidecar_active_mode();
 // guest frame (VBlank) so resident tiles are captured before eviction.
 void ws_sidecar_sync_frame();
 
+// Guest addresses the sidecar needs. These are per-game facts, so a game runner
+// supplies them through RunOptions rather than every launch carrying a row of
+// GBARECOMP_WS_SC_* environment variables. The env path remains for probing.
+struct WsSidecarConfig {
+    std::uint32_t draw_metatile_pc = 0;   // DrawMetatileAt (thumb PC, bit0 ignored)
+    std::uint32_t tilemap_ptrs = 0;       // gBGTilemapBuffers1 (3 consecutive ptrs)
+    std::uint32_t mapheader = 0;          // gMapHeader (mapLayout at +0)
+    std::uint32_t gmain = 0;              // gMain (callback2 at +4)
+    std::uint32_t cb2_overworld = 0;      // CB2_Overworld PC
+    std::uint32_t curcoords = 0;          // gObjectEvents[0].currentCoords
+    bool active = true;                   // Strategy-A active fill
+};
+
+// Arm the sidecar from explicit configuration. No-op if already armed or if the
+// two required addresses are absent.
+void ws_sidecar_init_from_config(const WsSidecarConfig& cfg);
+
 // Actively populate the extended cache (incl. never-seen margins) by invoking
 // the guest's own DrawMetatileAt over the expanded world region into VRAM
 // scratch. Requires GBARECOMP_WS_SC_MAPHEADER. Saves/restores guest state so it
