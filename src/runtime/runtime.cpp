@@ -2293,7 +2293,22 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #endif
         sync_resize_driven_view();
         if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
-        pacer.emplace();  // paces to the GBA's 59.7275 Hz
+        // Pace to the GBA's 59.7275 Hz — unless the display is already doing
+        // it. On Android GLES vsync genuinely blocks in SDL_RenderPresent, so
+        // a pacer on top is a second throttle beating against the first: the
+        // 59.7275 deadline slides against a 60.000 panel and lands a hitch
+        // roughly every 3.7 seconds. Desktop keeps the pacer, where vsync
+        // often does not block (see the cadence ring note in host_window).
+        bool display_paces = false;
+#if defined(__ANDROID__)
+        display_paces = win.vsync_enabled();
+#endif
+        if (!display_paces) {
+            pacer.emplace();
+        } else if (!args.quiet) {
+            std::fprintf(stderr,
+                "[gbarecomp:runtime] vsync paces presentation; frame pacer off\n");
+        }
     }
 
     // Host-window save-state slots: the ROM path with a .stateN

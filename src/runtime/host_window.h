@@ -91,6 +91,11 @@ public:
     void set_fps_readout(bool on);      // presents-per-second in the title bar
     bool fps_readout() const;
 
+    // True when the renderer reported SDL_RENDERER_PRESENTVSYNC. Where vsync
+    // genuinely blocks, a frame pacer on top of it is a second throttle
+    // beating against the first.
+    bool vsync_enabled() const;
+
     // Upload one base_w x base_h RGB888 frame (the dimensions passed to open())
     // and present.
     void present(const uint8_t* rgb888);

@@ -408,7 +408,11 @@ void ws_sidecar_active_fill() {
     const int kMaxMarginMt = (kCacheW / 2) - 16;   // stay inside the ring
     if (margin_mt > kMaxMarginMt) margin_mt = kMaxMarginMt;
     const int mx_lo = mtx0 - margin_mt, mx_hi = mtx0 + 15 + margin_mt;
-    const int my_lo = mty0 - 1,         my_hi = mty0 + 11;
+    // 10 metatiles cover the 160px screen; the extra rows are lookahead so a
+    // vertical scroll finds the next row already drawn. One row of slack was
+    // not enough — the margin ran out of rows mid-column and left a seam where
+    // freshly drawn tiles met stale ones.
+    const int my_lo = mty0 - 2,         my_hi = mty0 + 12;
 
     // Save state we transiently clobber.
     ArmCpuState saved = g_cpu;
