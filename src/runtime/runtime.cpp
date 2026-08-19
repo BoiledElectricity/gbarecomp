@@ -1564,7 +1564,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     ws_provenance_init_from_env();
     // Step C margin sidecar — gated by the WIP kill-switch (force-disabled unless
     // GBARECOMP_WS_WIP=1) so the shipped build never arms the broken margin path.
-    if (ws_wip_enabled) {
+    // A game that supplies its own guest addresses is vouching for the margin
+    // path on its own content, so it does not need the WIP kill-switch. That
+    // switch guards the env-configured probe path, where a wrong address just
+    // renders garbage.
+    if (ws_wip_enabled || (opts.ws_draw_metatile_pc && opts.ws_tilemap_ptrs)) {
         if (opts.ws_draw_metatile_pc && opts.ws_tilemap_ptrs) {
             WsSidecarConfig sc;
             sc.draw_metatile_pc = opts.ws_draw_metatile_pc;
