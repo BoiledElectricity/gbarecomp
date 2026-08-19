@@ -39,6 +39,16 @@ struct RunOptions {
     std::uint16_t max_resize_view_width = 240;
     bool resize_driven_view = false;
 
+    // Which scenes may expand is policy the GAME owns; the runtime only
+    // provides the mechanism. When view_gate_addr is set, the runtime reads
+    // that guest word once per frame and pillarboxes back to the faithful 240
+    // unless it matches, so title / menu / battle screens never expose the
+    // background's horizontal wrap as duplicated scenery. Leaving the address
+    // zero keeps expansion unconditional.
+    std::uint32_t view_gate_addr  = 0;
+    std::uint32_t view_gate_value = 0;
+    std::uint32_t view_gate_mask  = 0xFFFFFFFEu;   // ignore the Thumb bit
+
     // Optional game-owned content initializer. Called exactly once, after the
     // first non-native view has been authorized and applied. For a fixed view
     // that is during startup; for resize-driven view it is deferred until the

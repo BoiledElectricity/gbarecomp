@@ -98,6 +98,44 @@ void runtime_set_frame_present_hook(std::function<bool()>);
 namespace gbarecomp {
 namespace {
 
+// Side-effect-free guest word read for the view gate. Deliberately not
+// bus.read32(), which models open bus and prefetch — polling the gate must not
+// perturb the machine it is observing.
+std::uint32_t view_gate_read32(gba::GbaBus& bus, std::uint32_t addr) {
+    const std::uint8_t* p = nullptr;
+    std::uint32_t off = 0, size = 0;
+    if (addr >= 0x02000000u && addr < 0x02040000u) {
+        p = bus.ewram_ptr(); off = addr - 0x02000000u; size = 0x40000u;
+    } else if (addr >= 0x03000000u && addr < 0x03008000u) {
+        p = bus.iwram_ptr(); off = addr - 0x03000000u; size = 0x8000u;
+    }
+    if (!p || off + 4u > size) return 0u;
+    std::uint32_t v = 0;
+    std::memcpy(&v, p + off, sizeof(v));
+    return v;
+}
+
+// Per-frame scene policy: outside the scenes the game authorized, fall back to
+// the faithful 240 rather than showing whatever the background wraps to.
+void apply_view_gate(gba::GbaBus& bus, const RunOptions& opts, bool wide) {
+    if (!wide || opts.view_gate_addr == 0) return;
+    const std::uint32_t got =
+        view_gate_read32(bus, opts.view_gate_addr) & opts.view_gate_mask;
+    const std::uint32_t want = opts.view_gate_value & opts.view_gate_mask;
+    gba::g_ws_pillarbox = (got == want) ? 0 : 1;
+    if (std::getenv("GBARECOMP_VIEW_GATE_DEBUG")) {
+        static std::uint32_t last = 0xFFFFFFFFu;
+        if (got != last) {
+            last = got;
+            std::fprintf(stderr,
+                         "[view_gate] addr=%08X got=%08X want=%08X -> %s\n",
+                         opts.view_gate_addr, got, want,
+                         gba::g_ws_pillarbox ? "PILLARBOX" : "WIDE");
+            std::fflush(stderr);
+        }
+    }
+}
+
 constexpr std::size_t kMaxRomSize = 32u * 1024u * 1024u;
 
 struct Args {
@@ -1668,6 +1706,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // VBlank-start events; stopping on its increment puts the recomp at the
     // same PPU phase as both oracles. See runtime_bus_bridge.cpp.
     auto step_frame = [&]() -> bool {
+        // Every driver of the machine — windowed, headless, and the TCP
+        // debug server — goes through here, so the per-frame scene policy
+        // belongs here rather than in any one loop.
+        apply_view_gate(bus, opts, args.view_width > 240);
         uint64_t start_vbl = g_runtime_vblank_starts;
         constexpr uint64_t kMaxDispatchesPerFrame = 2'000'000ull;
         for (uint64_t i = 0; i < kMaxDispatchesPerFrame; ++i) {
@@ -2679,6 +2721,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // Widescreen sidecar: capture the live tilemap ring once per guest
         // frame (no-op unless armed) so resident tiles are cached before the
         // camera evicts them — the always-on substrate for margin injection.
+        apply_view_gate(bus, opts, args.view_width > 240);
         if (ws_sidecar_enabled()) {
             const uint64_t scf = ppu.frame_count();
             if (scf != sc_last_frame) {
@@ -2829,6 +2872,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // Widescreen sidecar: populate the extended tilemap (incl. never-seen
         // margins) via the guest's own draw, then force a FRESH render so the
         // wide path reads the filled cache instead of the run-time latched FB.
+        apply_view_gate(bus, opts, args.view_width > 240);
         bool fresh = false;
         if (ws_sidecar_enabled() && args.view_width > 240 &&
             ws_sidecar_active_mode()) {
