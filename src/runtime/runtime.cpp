@@ -2516,7 +2516,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             if (frame != last_presented_frame) {
                 const uint64_t fp_t0 = FramePhaseRing::now_ns();
                 const bool view_changed = sync_resize_driven_view();
-                if (ppu.has_latched_framebuffer() && !view_changed) {
+                // The latched framebuffer was produced while the frame ran,
+                // before the sidecar refilled the margin cache for this camera
+                // position. Reusing it shows margins one frame behind the
+                // centre — invisible while parked, and exactly the smear the
+                // edges get while walking. Re-render once the cache is current;
+                // the dump path already did this, which is why every capture
+                // looked correct while play did not.
+                const bool ws_margins_live =
+                    ws_sidecar_enabled() && ws_sidecar_active_mode() &&
+                    ppu.view_expanded();
+                if (ppu.has_latched_framebuffer() && !view_changed &&
+                    !ws_margins_live) {
                     std::memcpy(live_fb.data(), ppu.latched_framebuffer(),
                                 ppu.render_bytes());
                 } else {
@@ -2910,7 +2921,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             if (frame != last_presented_frame) {
                 const uint64_t fp_t0 = FramePhaseRing::now_ns();
                 const bool view_changed = sync_resize_driven_view();
-                if (ppu.has_latched_framebuffer() && !view_changed) {
+                // The latched framebuffer was produced while the frame ran,
+                // before the sidecar refilled the margin cache for this camera
+                // position. Reusing it shows margins one frame behind the
+                // centre — invisible while parked, and exactly the smear the
+                // edges get while walking. Re-render once the cache is current;
+                // the dump path already did this, which is why every capture
+                // looked correct while play did not.
+                const bool ws_margins_live =
+                    ws_sidecar_enabled() && ws_sidecar_active_mode() &&
+                    ppu.view_expanded();
+                if (ppu.has_latched_framebuffer() && !view_changed &&
+                    !ws_margins_live) {
                     std::memcpy(live_fb.data(), ppu.latched_framebuffer(),
                                 ppu.render_bytes());
                 } else {
