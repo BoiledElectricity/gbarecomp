@@ -297,6 +297,7 @@ add_library(gbarecomp_runtime STATIC
     src/runtime/host_window.cpp
     src/runtime/color_lut.cpp
     src/runtime/asset_picker.cpp
+    src/runtime/tts.cpp
     # Production abort stubs for runtime_dispatch_miss +
     # runtime_unimplemented_op. Test binaries that link only
     # gbarecomp_armv4t (not gbarecomp_runtime) supply their own.

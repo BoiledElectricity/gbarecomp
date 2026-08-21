@@ -37,6 +37,7 @@
 #include "../gba/sha1.h"
 #include "snapshot.h"
 #include "tcp_debug_server.h"
+#include "tts.h"
 #ifdef GBA_COSIM
 #include "cosim.h"           // cosim_init() — first-divergence oracle TCP server
 #endif
@@ -170,6 +171,10 @@ struct Args {
     // whatever the game runner passed in RunOptions.
     uint32_t ws_draw_metatile = 0, ws_tilemap_ptrs = 0, ws_mapheader = 0;
     uint32_t ws_curcoords = 0, ws_gmain = 0, ws_cb2_overworld = 0;
+    std::vector<TtsHook> tts_message_pcs;    // [tts].message_pcs
+    uint32_t tts_printers_addr = 0;          // [tts].printers
+    uint32_t tts_objevents_addr = 0;         // [tts].object_events
+    uint32_t tts_selected_addr = 0;          // [tts].selected_object
     int  autosave_minutes = 0;    // --autosave N: rotating snapshot every N min
     bool load_autosave = false;   // --load-autosave: boot from the newest one
     // [video] screen = raw|unlit|frontlit|backlit|classic — present-time
@@ -593,6 +598,37 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
             args->rom_sha1 = lower_ascii(val);
         } else if (section == "rom" && key == "crc32") {
             args->rom_crc32 = parse_hex_u32(val);
+        } else if (section == "tts" && key == "object_events" && !val.empty()) {
+            uint64_t v = 0;
+            if (parse_u64(val, &v)) args->tts_objevents_addr = (uint32_t)v;
+        } else if (section == "tts" && key == "selected_object" && !val.empty()) {
+            uint64_t v = 0;
+            if (parse_u64(val, &v)) args->tts_selected_addr = (uint32_t)v;
+        } else if (section == "tts" && key == "printers" && !val.empty()) {
+            uint64_t v = 0;
+            if (parse_u64(val, &v)) args->tts_printers_addr = (uint32_t)v;
+        } else if (section == "tts" && key == "message_pcs" && !val.empty()) {
+            std::size_t pos = 0;
+            while (pos < val.size()) {
+                std::size_t comma = val.find(',', pos);
+                if (comma == std::string::npos) comma = val.size();
+                std::string tok = val.substr(pos, comma - pos);
+                while (!tok.empty() && std::isspace((unsigned char)tok.front()))
+                    tok.erase(tok.begin());
+                while (!tok.empty() && std::isspace((unsigned char)tok.back()))
+                    tok.pop_back();
+                int reg = 0;
+                const std::size_t colon = tok.find(':');
+                if (colon != std::string::npos) {
+                    reg = std::atoi(tok.c_str() + colon + 1);
+                    tok = tok.substr(0, colon);
+                }
+                uint64_t v = 0;
+                if (!tok.empty() && parse_u64(tok, &v))
+                    args->tts_message_pcs.push_back(
+                        TtsHook{static_cast<uint32_t>(v), reg});
+                pos = comma + 1;
+            }
         } else if (section == "widescreen" && !val.empty()) {
             uint64_t n = 0;
             if (parse_u64(val, &n)) {
@@ -1652,6 +1688,25 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
     }
 
+    // After the sidecar: it installs the function-entry hook by assignment
+    // rather than chaining, so anything armed earlier is silently dropped.
+    // TTS chains onto whatever it finds, so it has to go last.
+    {
+        // game.toml wins: these addresses differ per game, and main.cpp is one
+        // file shared by every variant.
+        tts::Config tcfg;
+        const auto& src = !args.tts_message_pcs.empty() ? args.tts_message_pcs
+                                                        : opts.tts_message_pcs;
+        for (const auto& h : src) tcfg.hooks.push_back({h.pc, h.reg});
+        if (!tcfg.hooks.empty()) {
+            tts::init(tcfg);
+            tts::set_printers_addr(args.tts_printers_addr
+                                       ? args.tts_printers_addr
+                                       : opts.tts_printers_addr);
+            tts::set_speaker_addrs(args.tts_objevents_addr, args.tts_selected_addr);
+        }
+    }
+
     // ── Recompiler exec gate ──────────────────────────────────────
     //
     // The runtime is recompiler-driven (PRINCIPLES.md "Interpreter
@@ -2301,7 +2356,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // often does not block (see the cadence ring note in host_window).
         bool display_paces = false;
 #if defined(__ANDROID__)
-        display_paces = win.vsync_enabled();
+        // Only when the panel runs near the GBA's rate. A 120 Hz phone with
+        // vsync pacing and no frame pacer runs the game at double speed —
+        // audible immediately, since the music plays twice as fast.
+        const int hz = win.refresh_hz();
+        display_paces = win.vsync_enabled() && hz >= 58 && hz <= 62;
+        if (!display_paces && win.vsync_enabled()) {
+            std::fprintf(stderr,
+                "[gbarecomp:runtime] display is %d Hz, not near 59.7275; "
+                "keeping the frame pacer\n", hz);
+            std::fflush(stderr);
+        }
 #endif
         if (!display_paces) {
             pacer.emplace();
@@ -2997,6 +3062,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 save_last_flush_frame = fc_now;
             }
         }
+        tts::tick();
         // Autosave, taken at a frame boundary — the only place the host
         // call-return stack is consistent enough to snapshot.
         if (autosave_interval_frames) {
@@ -3124,6 +3190,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 
     gbarecomp::overlay_loader_shutdown();  // join worker + drain before banner
     emit_exit_diagnostics();
+    tts::shutdown();
     runtime_shutdown();
     return save_ok ? 0 : 1;
 }

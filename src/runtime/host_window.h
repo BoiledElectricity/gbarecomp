@@ -96,6 +96,10 @@ public:
     // beating against the first.
     bool vsync_enabled() const;
 
+    // Panel's nominal refresh in Hz, 0 when unknown. Vsync only paces the game
+    // correctly when this is near the GBA's 59.7275 Hz.
+    int refresh_hz() const;
+
     // Upload one base_w x base_h RGB888 frame (the dimensions passed to open())
     // and present.
     void present(const uint8_t* rgb888);

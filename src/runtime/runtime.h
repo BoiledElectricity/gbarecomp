@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 namespace gbarecomp {
 
@@ -20,6 +21,13 @@ namespace gbarecomp {
 // the runtime keeps whatever it would have used otherwise (BIOS
 // constants from GbaBios, empty ROM hash that forces the user to
 // provide --config or --rom-sha1).
+// A guest function whose entry means text is being shown, plus which argument
+// register carries the string — that differs by signature.
+struct TtsHook {
+    std::uint32_t pc = 0;
+    int           reg = 0;
+};
+
 struct RunOptions {
     const char*   builtin_game_name = nullptr;
     const char*   builtin_rom_sha1  = nullptr;
@@ -54,6 +62,13 @@ struct RunOptions {
     // Guest addresses the widescreen margin sidecar needs. Per-game facts, so
     // the game supplies them instead of every launch carrying a row of
     // GBARECOMP_WS_SC_* environment variables. Zero = do not arm.
+    // Guest functions that show a field message (people, signs, popups).
+    // Entering one is the cue to speak it aloud, for players who cannot read
+    // yet. Empty leaves the feature off. Battle text uses a different guest
+    // function and is deliberately not listed.
+    std::uint32_t tts_printers_addr = 0;     // sTextPrinters, for page pacing
+    std::vector<TtsHook> tts_message_pcs;
+
     std::uint32_t ws_draw_metatile_pc = 0;   // DrawMetatileAt
     std::uint32_t ws_tilemap_ptrs     = 0;   // gBGTilemapBuffers1
     std::uint32_t ws_mapheader        = 0;   // gMapHeader

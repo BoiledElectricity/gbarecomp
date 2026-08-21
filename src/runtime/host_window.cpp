@@ -313,6 +313,7 @@ struct Backend {
     // MC-WS-002: always-on per-present timing/scanout ring (see above).
     PresentCadence cadence;
     bool vsync = false;         // renderer reported SDL_RENDERER_PRESENTVSYNC
+    int  refresh_hz = 0;        // panel's nominal rate, 0 if unknown
 
     // ---- game controllers (see pad_keyinput) ------------------------------
     std::vector<SDL_GameController*> pads;
@@ -831,6 +832,12 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
             std::fflush(stderr);
         }
         log_display_mode(b->window, "open");
+        {
+            const int di = SDL_GetWindowDisplayIndex(b->window);
+            SDL_DisplayMode dm{};
+            if (di >= 0 && SDL_GetCurrentDisplayMode(di, &dm) == 0)
+                b->refresh_hz = dm.refresh_rate;
+        }
     }
     b->cadence.init();
     if (b->expanded_view || b->resize_driven_view) {
@@ -1304,6 +1311,11 @@ bool HostWindow::vsync_enabled() const {
     return static_cast<const Backend*>(impl_)->vsync;
 }
 
+int HostWindow::refresh_hz() const {
+    if (!open_ || !impl_) return 0;
+    return static_cast<const Backend*>(impl_)->refresh_hz;
+}
+
 HostWindow::Events HostWindow::pump() {
     Events ev{};
     if (!open_) { ev.quit = true; return ev; }
@@ -1440,6 +1452,7 @@ void HostWindow::set_runtime_ui(RecompRuntimeUi* /*ui*/) {}
 void HostWindow::set_fps_readout(bool /*on*/) {}
 bool HostWindow::fps_readout() const { return false; }
 bool HostWindow::vsync_enabled() const { return false; }
+int HostWindow::refresh_hz() const { return 0; }
 
 void HostWindow::push_audio_samples(const int16_t* /*samples*/,
                                     std::size_t /*count*/) {}
